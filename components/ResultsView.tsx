@@ -1013,7 +1013,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
   const selectedDoc = documents.find(d => d.id === selectedDocId);
 
   return (
-    <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl overflow-hidden backdrop-blur flex flex-col h-[600px] relative">
+    <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl overflow-hidden backdrop-blur flex flex-col h-full relative">
 
       {/* Citation Detail Overlay */}
       {selectedCitation && (

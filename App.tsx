@@ -803,7 +803,7 @@ const App: React.FC = () => {
 
       {/* Header */}
       <header className={`border-b border-zinc-800 bg-zinc-950/80 backdrop-blur sticky top-0 z-40 transition-all ${isBlurring ? 'blur-sm grayscale' : ''}`}>
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+        <div className="w-full px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className={`w-8 h-8 rounded flex items-center justify-center shadow-lg transition-colors ${aiProvider === 'gemini' ? 'bg-indigo-600 shadow-indigo-500/20' : 'bg-orange-600 shadow-orange-500/20'}`}>
               <Cpu className="text-white w-5 h-5" />
@@ -825,7 +825,7 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      <main className={`flex-1 max-w-7xl mx-auto px-6 py-8 w-full flex flex-col gap-8 transition-all duration-500 ${isBlurring ? 'blur-sm opacity-50 pointer-events-none' : ''}`}>
+      <main className={`flex-1 w-full px-6 py-8 flex flex-col gap-8 transition-all duration-500 ${isBlurring ? 'blur-sm opacity-50 pointer-events-none' : ''}`}>
 
         {/* Input Section */}
         <section className="relative group">
