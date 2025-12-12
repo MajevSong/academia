@@ -1,0 +1,5 @@
+{
+  "name": "Cognito Autonomous Research Architect",
+  "description": "An AI-powered academic research orchestra that simulates a multi-agent workflow (Librarian, Data Scientist, Ghostwriter, Reviewer) to generate high-quality academic papers in LaTeX format.",
+  "requestFramePermissions": []
+}

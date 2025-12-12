@@ -1,0 +1,20 @@
+{
+    "rewrites": [
+        {
+            "source": "/api/semantic/(.*)",
+            "destination": "/api/semantic.js"
+        },
+        {
+            "source": "/api/scihub/(.*)",
+            "destination": "/api/scihub.js?path=$1"
+        },
+        {
+            "source": "/api/proxy",
+            "destination": "/api/proxy.js"
+        },
+        {
+            "source": "/((?!api/.*).*)",
+            "destination": "/index.html"
+        }
+    ]
+}
