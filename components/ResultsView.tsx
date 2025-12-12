@@ -702,10 +702,10 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
     setActiveTab('data');
     setActiveDataSubTab('docs');
 
-    // PRIORITY: Use Sci-Hub if DOI exists to bypass paywalls
-    // BUT only if paper.url is NOT a direct PDF (some openAccessPdf URLs are already direct)
+    // PRIORITY: Trust the paper.url first (The "Source" Button URL).
+    // Use Sci-Hub ONLY if the source URL is likely a Paywall (generic DOI link) AND we have a DOI.
     let downloadUrl = paper.url;
-    if (!downloadUrl.toLowerCase().endsWith('.pdf') && paper.doi) {
+    if (paper.doi && (downloadUrl.includes('doi.org') || !downloadUrl)) {
       downloadUrl = `${SCI_HUB_MIRRORS[0]}/${paper.doi}`;
     }
 
