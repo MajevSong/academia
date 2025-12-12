@@ -697,198 +697,168 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
       return;
     }
 
-    // 2. Start Download Process
     setIsDownloading(true);
     setActiveTab('data');
     setActiveDataSubTab('docs');
 
-    // PRIORITY: Trust the paper.url first (The "Source" Button URL).
-    // Use Sci-Hub ONLY if the source URL is likely a Paywall (generic DOI link) AND we have a DOI.
-    let downloadUrl = paper.url;
-    if (paper.doi && (downloadUrl.includes('doi.org') || !downloadUrl)) {
-      downloadUrl = `${SCI_HUB_MIRRORS[0]}/${paper.doi}`;
-    }
+    // Helper: Attempt to download from a specific URL
+    const attemptDownload = async (targetUrl: string, isSciHub: boolean): Promise<DownloadedDocument | null> => {
+      try {
+        let response: Response;
+
+        // A. FETCHING STRATEGY
+        if (isSciHub || targetUrl.includes('sci-hub')) {
+          // Sci-Hub Proxy Route
+          const path = targetUrl.replace(/^https?:\/\/(www\.)?sci-hub\.[a-z]+(\/)?/, '');
+          response = await fetch(`/api/scihub/${path}`);
+        } else {
+          // Standard URL - Try Direct first, then Generic Proxy
+          try {
+            const directCheck = await fetch(targetUrl, { method: 'HEAD' });
+            if (directCheck.ok) {
+              response = await fetch(targetUrl);
+            } else {
+              throw new Error("Direct fetch failed");
+            }
+          } catch (directError) {
+            // Fallback to Proxy
+            console.log(`Direct access to ${targetUrl} failed, trying proxy...`);
+            response = await fetch(`/api/proxy?url=${encodeURIComponent(targetUrl)}`);
+          }
+        }
+
+        if (!response || !response.ok) return null;
+
+        const contentType = response.headers.get('content-type') || '';
+        const docId = Math.random().toString(36).substring(7);
+
+        // B. PROCESS RESPONSE (PDF vs HTML)
+        if (contentType.includes('application/pdf') || contentType.includes('octet-stream')) {
+          const blob = await response.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          const extractedText = await extractTextFromPdf(blobUrl).catch(() => "");
+
+          return {
+            id: docId,
+            paperId: index,
+            title: paper.title,
+            type: 'pdf',
+            content: blobUrl,
+            textContent: extractedText,
+            originalUrl: targetUrl,
+            timestamp: new Date().toLocaleTimeString()
+          };
+        }
+
+        if (contentType.includes('text/html')) {
+          // If we expected a PDF but got HTML (common with Sci-Hub or Publisher pages)
+          // If this was a Sci-Hub attempt, try to scrape the PDF iframe
+          const htmlText = await response.text();
+          let finalHtml = htmlText;
+
+          if (isSciHub || targetUrl.includes('sci-hub')) {
+            const pdfSrcMatch = htmlText.match(/<iframe.*?src=["'](.*?)["']/i) || htmlText.match(/<embed.*?src=["'](.*?)["']/i);
+            if (pdfSrcMatch && pdfSrcMatch[1]) {
+              let pdfDirectUrl = pdfSrcMatch[1];
+              if (pdfDirectUrl.startsWith('//')) pdfDirectUrl = 'https:' + pdfDirectUrl;
+              if (!pdfDirectUrl.includes('sci-hub')) {
+                const mirrorBase = SCI_HUB_MIRRORS[0];
+                if (pdfDirectUrl.startsWith('/')) pdfDirectUrl = mirrorBase + pdfDirectUrl;
+              }
+              // Recursively try to download the scraped PDF link
+              return attemptDownload(pdfDirectUrl, true);
+            }
+          }
+
+          // If it's a regular Publisher HTML page, we still save it, but maybe prioritize Sci-Hub later?
+          // For now, return the HTML doc.
+
+          // INJECT BASE TAG TO FIX RELATIVE LINKS
+          try {
+            const urlObj = new URL(targetUrl);
+            const baseTag = `<base href="${urlObj.origin}" target="_blank">`;
+            // Try to inject after head, otherwise prepend to body or just at start
+            if (finalHtml.includes('<head>')) {
+              finalHtml = finalHtml.replace('<head>', `<head>${baseTag}`);
+            } else {
+              finalHtml = `${baseTag}${finalHtml}`;
+            }
+          } catch (e) {
+            console.warn("Could not inject base tag", e);
+          }
+
+          // STRIP SCRIPTS TO PREVENT SANDBOX ERRORS
+          finalHtml = finalHtml.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gm, "");
+
+          return {
+            id: docId,
+            paperId: index,
+            title: paper.title,
+            type: 'html',
+            content: finalHtml,
+            textContent: htmlText.replace(/<[^>]*>?/gm, ' ').substring(0, 10000),
+            originalUrl: targetUrl,
+            timestamp: new Date().toLocaleTimeString()
+          };
+        }
+
+        return null;
+
+      } catch (e) {
+        console.warn(`Attempt failed for ${targetUrl}:`, e);
+        return null;
+      }
+    };
 
     try {
-      // PROXY FALLBACK STRATEGY
-      let response: Response | null = null;
-      let usedMirrorIndex = 0;
-      let finalContentType = '';
+      let finalDoc: DownloadedDocument | null = null;
 
+      // ATTEMPT 1: Verified Source URL (The Green Button Link)
+      // We only skip this if it's a generic DOI link which we know needs Sci-Hub
+      const isGenericDoi = paper.url && paper.url.includes('doi.org');
 
-      // 1. Attempt Direct/Proxy Download
+      if (paper.url && !isGenericDoi) {
+        console.log("Attempt 1: Verified Source URL", paper.url);
+        finalDoc = await attemptDownload(paper.url, false);
+      }
 
+      // ATTEMPT 2: Sci-Hub Fallback
+      // If Attempt 1 failed OR returned HTML (when we might prefer a Real PDF), OR if Attempt 1 was skipped
+      // Note: If Attempt 1 gave us HTML, we might still want to try Sci-Hub to see if we can get a PDF.
+      // But for now, if Attempt 1 succeeded with HTML, we keep it, UNLESS the user explicitly wants PDF priority.
+      // Let's assume if Attempt 1 returned NULL, we try Sci-Hub.
 
-      // Helper to fetch via local proxy if needed
-      const fetchViaProxy = async (targetUrl: string, useSciHubProxy: boolean = false) => {
-        // If it's a Sci-Hub URL, route through our specific proxy
-        if (useSciHubProxy || targetUrl.includes('sci-hub')) {
-          // Remove protocol and domain from targetUrl to append to proxy path if needed, 
-          // but for simplicity, we just assume the proxy forwards everything.
-          // Actually, our proxy is: /api/scihub -> https://sci-hub.se
-          // So we need to strip https://sci-hub.se from the targetUrl
-          const path = targetUrl.replace(/^https?:\/\/(www\.)?sci-hub\.[a-z]+(\/)?/, '');
-          return fetch(`/api/scihub/${path}`);
+      if ((!finalDoc || finalDoc.type === 'html') && paper.doi) {
+        console.log("Attempt 2: Sci-Hub Fallback");
+        const sciHubUrl = `${SCI_HUB_MIRRORS[0]}/${paper.doi}`;
+        const sciHubDoc = await attemptDownload(sciHubUrl, true);
+
+        // If Sci-Hub gave us a PDF, definitely use that over any HTML we might have found
+        if (sciHubDoc && sciHubDoc.type === 'pdf') {
+          finalDoc = sciHubDoc;
+        } else if (!finalDoc && sciHubDoc) {
+          finalDoc = sciHubDoc; // Use Sci-Hub HTML if we had nothing else
         }
+      }
 
-        // For other PDFs, try direct fetch first (CORS might allow it)
-        try {
-          const direct = await fetch(targetUrl, { method: 'HEAD' });
-          if (direct.ok) return fetch(targetUrl);
-        } catch (e) { /* Fallback to proxy if direct fails */ }
-
-        // Fallback: We don't have a generic proxy for everything, so we assume direct fetch failure
-        // means we can't get it client-side.
-        throw new Error("CORS blocked and no generic proxy available.");
-      };
-
-      if (downloadUrl.includes('sci-hub')) {
-        // Try via our local Sci-Hub proxy
-        const path = downloadUrl.replace(/^https?:\/\/(www\.)?sci-hub\.[a-z]+(\/)?/, '');
-        response = await fetch(`/api/scihub/${path}`);
+      if (finalDoc) {
+        setDocuments(prev => [...prev, finalDoc!]);
+        setSelectedDocId(finalDoc.id);
       } else {
-        // Try direct
-        try {
-          const directCheck = await fetch(downloadUrl, { method: 'HEAD' });
-          if (directCheck.ok) {
-            response = await fetch(downloadUrl);
-          } else {
-            throw new Error("Direct HEAD failed");
-          }
-        } catch (e) {
-          console.warn("Direct fetch failed, trying generic proxy for:", downloadUrl);
-          // FALLBACK TO GENERIC PROXY
-          try {
-            response = await fetch(`/api/proxy?url=${encodeURIComponent(downloadUrl)}`);
-          } catch (proxyErr) {
-            console.error("Generic Proxy Failed:", proxyErr);
-            throw new Error("Cannot download this document directly due to browser security restrictions. Please open the link manually.");
-          }
-        }
+        // Ultimate Fallback: Just Link
+        throw new Error("All download attempts failed");
       }
-
-      if (!response || !response.ok) {
-        throw new Error(`Download failed: ${response?.statusText || 'Unknown Error'}`);
-      }
-
-      finalContentType = response.headers.get('content-type') || '';
-      const docId = Math.random().toString(36).substring(7);
-
-      let newDoc: DownloadedDocument;
-
-      if (finalContentType.includes('application/pdf') ||
-        finalContentType.includes('octet-stream') ||
-        finalContentType.includes('force-download') ||
-        finalContentType.includes('application/download')) {
-        // Direct PDF or Binary Stream (Assume PDF)
-        const blob = await response.blob();
-        const blobUrl = URL.createObjectURL(blob);
-
-        // Extract text for AI Analysis (using PDF.js helper)
-        let extractedText = "";
-        try {
-          extractedText = await extractTextFromPdf(blobUrl);
-          console.log("PDF Text Extracted:", extractedText.length, "chars");
-        } catch (e) { console.warn("Text extraction failed", e); }
-
-        newDoc = {
-          id: docId,
-          paperId: index,
-          title: paper.title,
-          type: 'pdf',
-          content: blobUrl,
-          textContent: extractedText,
-          originalUrl: downloadUrl,
-          timestamp: new Date().toLocaleTimeString()
-        };
-      } else {
-        // HTML
-        const htmlText = await response.text();
-        let finalHtml = htmlText;
-        let extractedText = ""; // For AI
-
-        // 1. Try to scrape direct PDF link from Sci-Hub HTML
-        if (downloadUrl.includes('sci-hub')) {
-          const pdfSrcMatch = htmlText.match(/<iframe.*?src=["'](.*?)["']/i) || htmlText.match(/<embed.*?src=["'](.*?)["']/i);
-          if (pdfSrcMatch && pdfSrcMatch[1]) {
-            let pdfDirectUrl = pdfSrcMatch[1];
-            if (pdfDirectUrl.startsWith('//')) pdfDirectUrl = 'https:' + pdfDirectUrl;
-            if (pdfDirectUrl.startsWith('/')) {
-              const mirrorBase = SCI_HUB_MIRRORS[usedMirrorIndex];
-              pdfDirectUrl = mirrorBase + pdfDirectUrl;
-            }
-
-            console.log("Found direct PDF link in Sci-Hub:", pdfDirectUrl);
-
-            try {
-              const pdfRes = await fetchViaProxy(pdfDirectUrl);
-              if (pdfRes && (pdfRes.headers.get('content-type') || '').includes('pdf')) {
-                const blob = await pdfRes.blob();
-                const blobUrl = URL.createObjectURL(blob);
-
-                // Extract text from the real PDF
-                try {
-                  extractedText = await extractTextFromPdf(blobUrl);
-                } catch (e) { }
-
-                newDoc = {
-                  id: docId,
-                  paperId: index,
-                  title: paper.title,
-                  type: 'pdf',
-                  content: blobUrl,
-                  textContent: extractedText,
-                  originalUrl: pdfDirectUrl,
-                  timestamp: new Date().toLocaleTimeString()
-                };
-                setDocuments(prev => [...prev, newDoc]);
-                setSelectedDocId(docId);
-                return; // Success!
-              }
-            } catch (e) {
-              console.warn("Failed to fetch scraped PDF direct link", e);
-            }
-          }
-        }
-
-        // 3. IF WE ARE HERE, AUTOMATED DOWNLOAD FAILED (It's HTML and we couldn't extract PDF)
-        console.warn(`[Download] Rejected Content-Type: ${finalContentType || 'unknown'}. Expected PDF.`);
-
-        // Instead of rendering broken HTML (which causes CORS/Sandbox errors), ask user to open link.
-        throw new Error("Automated download failed. Source is not a direct PDF (likely HTML wrapper or CAPTCHA).");
-
-        const baseTag = `<base href="${new URL(downloadUrl).origin}" target="_blank">`;
-        finalHtml = finalHtml.replace('<head>', `<head>${baseTag}`);
-
-        // Extract text from HTML by stripping tags (primitive but effective for context)
-        extractedText = htmlText.replace(/<[^>]*>?/gm, ' ');
-
-        newDoc = {
-          id: docId,
-          paperId: index,
-          title: paper.title,
-          type: 'html',
-          content: finalHtml,
-          textContent: extractedText,
-          originalUrl: downloadUrl,
-          timestamp: new Date().toLocaleTimeString()
-        };
-      }
-
-      setDocuments(prev => [...prev, newDoc]);
-      setSelectedDocId(docId);
 
     } catch (error) {
-      console.error("Download failed, falling back to link mode", error);
-      // Fallback: Just store the link if fetch fails
+      console.error("All strategies failed", error);
       const docId = Math.random().toString(36).substring(7);
       const newDoc: DownloadedDocument = {
         id: docId,
         paperId: index,
         title: paper.title,
         type: 'link',
-        content: downloadUrl,
-        originalUrl: downloadUrl,
+        content: paper.url || "",
+        originalUrl: paper.url || "",
         timestamp: new Date().toLocaleTimeString()
       };
       setDocuments(prev => [...prev, newDoc]);

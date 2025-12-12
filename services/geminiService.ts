@@ -704,8 +704,16 @@ GÖREV: Aşağıdaki makaleleri ve kaynakları kullanarak "${topic}" konusu üze
 
 TALİMATLAR:
 1. Listede verilen HER BİR makale için ayrı ve detaylı bir özet yaz.
-2. "FULL TEXT PROVIDED" (Tam Metin) olanlar için: Tam metni kullanarak çok detaylı, kapsamlı (en az 4-5 paragraf) bir özet çıkar. Asla kısaltma yapma.
-3. "ABSTRACT ONLY" (Sadece Özet) olanlar için: Mevcut abstract metnini OLDUĞU GİBİ, KELİMESİ KELİMESİNE Türkçe'ye çevir. ASLA KENDİ CÜMLELERİNLE YENİDEN YAZMA (PARAPHRASE YAPMA). Kaynakta ne varsa birebir çevirisi raporda yer almalıdır. Ekleme veya çıkarma yapma.
+2. "FULL TEXT PROVIDED" (Tam Metin) olanlar için:
+   - Makale içeriğini derinlemesine analiz et.
+   - Sadece genel bir özet yazma; çalışmanın Amacı, Yöntemi, Bulguları ve Sonuçları gibi ana başlıkları detaylandır.
+   - METİNDEKİ ÖNEMLİ NOKTALARI VE VERİLERİ (Örn: % oranlar, p değerleri, istatistikler) mutlaka vurgula.
+   - En az 4-5 paragraflık kapsamlı bir inceleme olsun.
+
+3. "ABSTRACT ONLY" (Sadece Özet) olanlar için:
+   - Mevcut abstract metnini OLDUĞU GİBİ, KELİMESİ KELİMESİNE Türkçe'ye çevir.
+   - ASLA yorum katma, özetleme veya kısaltma.
+   - Metinde ne yazıyorsa birebir aynısı olsun. "Bu çalışma şunu amaçlar..." gibi dolaylı anlatım yerine, yazarın ağzından yazılmış gibi çevir.
 4. ÖNEMLİ FORMAT KURALI: Her özetin en başında mutlaka çalışmanın yazarlarından bahset. 
    Örnek: "Yılmaz ve arkadaşları (2023) tarafından yapılan bu çalışmada..." veya "Smith (2022) bu araştırmasında..."
 
