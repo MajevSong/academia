@@ -393,6 +393,23 @@ export const analyzeRequirements = async (text: string, provider: AIProvider, ol
   }
 };
 
+// --- GOOGLE SCHOLAR SEARCH (Scraper via Proxy) ---
+const searchGoogleScholar = async (query: string, maxLimit: number = 10): Promise<Paper[]> => {
+  try {
+    const res = await fetch(`/api/scholar?q=${encodeURIComponent(query)}&num=${maxLimit}`);
+    if (!res.ok) throw new Error(res.statusText);
+    const json = await res.json();
+    return (json.organic_results || []).map((p: any) => ({
+      ...p,
+      url: p.pdf_link || p.link || "",
+      summary: p.summary || p.snippet || "No summary available."
+    }));
+  } catch (e) {
+    console.error("Google Scholar Scrape Failed:", e);
+    return [];
+  }
+};
+
 // --- Librarian Agent ---
 
 const librarianLocalSchema: Schema = {
@@ -438,6 +455,7 @@ export const runLibrarianAgent = async (
     } catch (e) { return { papers: [], researchGap: "Local analysis failed." }; }
   }
 
+  // SEMANTIC SCHOLAR STRATEGY
   if (searchProvider === 'semantic_scholar') {
     const targetDepth = filters.scanDepth || 50;
     let aggregatedPapers: Paper[] = [];
@@ -473,13 +491,31 @@ export const runLibrarianAgent = async (
     }
 
     const finalPapers = aggregatedPapers.slice(0, targetDepth);
-
-    // SKIP IMMEDIATE GAP ANALYSIS (User requested to defer this until Final Report)
     const gapAnalysis = "Gap analysis will be generated after Final Report.";
-
     return { papers: finalPapers, researchGap: gapAnalysis };
   }
 
+  // GOOGLE SCHOLAR STRATEGY (NEW)
+  if (searchProvider === 'google_scholar') {
+    const aiQuery = await optimizeSearchQuery(topic, provider, ollamaConfig, apiKey);
+    console.log(`Google Scholar Search for: "${aiQuery}"`);
+
+    const papers = await searchGoogleScholar(aiQuery, filters.scanDepth || 20);
+
+    if (papers.length === 0) {
+      // Fallback to basic keywords if AI query fails
+      const basicQuery = extractKeywordsBasic(topic);
+      if (basicQuery !== aiQuery) {
+        const fallbackPapers = await searchGoogleScholar(basicQuery, 20);
+        if (fallbackPapers.length > 0) return { papers: fallbackPapers, researchGap: "Gap analysis will be generated after Final Report." };
+      }
+      return { papers: [], researchGap: "Google Scholar returned no results (or blocked)." };
+    }
+
+    return { papers, researchGap: "Gap analysis will be generated after Final Report." };
+  }
+
+  // STANDARD GOOGLE SEARCH (Legacy/Fallback)
   const prompt = `Role: Librarian. Find 6 academic sources for: "${topic}". Use Google Search. Return JSON.`;
   try {
     const ai = getAIClient(apiKey);
@@ -508,9 +544,36 @@ export const fetchAbstractFromUrl = async (targetUrl: string, provider: AIProvid
     // We treat it as a generic proxy request
     const proxyUrl = `/api/proxy?url=${encodeURIComponent(targetUrl)}`;
     const res = await fetch(proxyUrl);
-    if (!res.ok) throw new Error("Failed to fetch page content");
 
-    const htmlText = await res.text();
+    let htmlText = "";
+    try {
+      htmlText = await res.text();
+    } catch (e) {
+      console.warn("Failed to read text:", e);
+    }
+
+    // CHECK FOR CLOUDFLARE / AKAMAI BLOCKS
+    const isBlocked = htmlText.includes("Please contact our support team") ||
+      htmlText.includes("Reference number:") ||
+      htmlText.includes("Cloudflare Ray ID") ||
+      res.status === 403 || res.status === 504 || res.status === 401;
+
+    if (isBlocked) {
+      console.log("Publisher Security Block Detected. Attempting Google Cache Fallback...");
+      try {
+        const cacheUrl = `http://webcache.googleusercontent.com/search?q=cache:${encodeURIComponent(targetUrl)}`;
+        // Use the same proxy to fetch the cache
+        const cacheResponse = await fetch(`/api/proxy?url=${encodeURIComponent(cacheUrl)}`);
+        if (cacheResponse.ok) {
+          htmlText = await cacheResponse.text();
+        }
+      } catch (e) {
+        console.warn("Cache fallback failed", e);
+      }
+    } else if (!res.ok) {
+      throw new Error(`Failed to fetch content (Status: ${res.status})`);
+    }
+
     // Strip minimal tags to reduce token usage, but keep structure
     const cleanedHtml = htmlText.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gmi, "")
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gmi, "")
@@ -518,12 +581,14 @@ export const fetchAbstractFromUrl = async (targetUrl: string, provider: AIProvid
       .slice(0, 30000); // Limit context
 
     const prompt = `
-    TASK: Extract the ACADEMIC ABSTRACT from the following web page content.
+    TASK: Analyze the following web page content to extract or generate a comprehensive summary of the academic paper.
+
     RULES:
-    1. Extract the text VERBATIM (Word-for-word).
-    2. Do NOT summarize. Do NOT format.
-    3. Return ONLY the abstract text.
-    4. If no abstract is found, return "NO_ABSTRACT_FOUND".
+    1. Look for an explicit "Abstract" section first. If found, extract it VERBATIM.
+    2. If NO explicit abstract is found, YOU MUST GENERATE A SUMMARY based on the Introduction, Methods, and Conclusion sections present in the text.
+    3. The output must be a single cohesive paragraph (200-300 words).
+    4. Start with "[Extracted]" if found verbatim, or "[Generated Summary]" if you had to summarize it.
+    5. Do NOT return "NO_ABSTRACT_FOUND". Always return content.
 
     Web Content:
     ${cleanedHtml}

@@ -383,7 +383,10 @@ const App: React.FC = () => {
     setClarificationFiles([]);
     setClarificationImages([]);
 
-    const providerLabel = searchProvider === 'semantic_scholar' ? 'Semantic Scholar' : 'Google';
+    let providerLabel = 'Standard Google';
+    if (searchProvider === 'semantic_scholar') providerLabel = 'Semantic Scholar';
+    if (searchProvider === 'google_scholar') providerLabel = 'Google Scholar';
+
     addLog('SYSTEM', `Boot sequence initiated (${aiProvider.toUpperCase()}) for: "${topic}"`, 'info');
     if (researchMode === 'web') {
       addLog('SYSTEM', `Search Provider: ${providerLabel}`, 'info');
@@ -555,35 +558,27 @@ const App: React.FC = () => {
             </div>
 
             {/* Search Provider */}
-            <div className="space-y-2">
+            <div className="space-y-2 mb-4">
               <label className="text-xs text-zinc-400 font-mono uppercase">Search Provider</label>
-              <div className="flex bg-zinc-950 p-1 rounded-lg border border-zinc-800">
-                <button
-                  onClick={() => setSearchProvider('google')}
-                  disabled={researchMode === 'local' || aiProvider === 'ollama'}
-                  className={`flex-1 py-1.5 text-xs font-bold rounded flex items-center justify-center gap-2 transition-all ${searchProvider === 'google' ? 'bg-emerald-600 text-white' : 'text-zinc-500 hover:text-zinc-300'} ${(researchMode === 'local' || aiProvider === 'ollama') ? 'opacity-30 cursor-not-allowed' : ''}`}
-                  title={aiProvider === 'ollama' ? "Ollama cannot use Google Search" : "Standard Google Search"}
-                >
-                  <Search className="w-3 h-3" /> Google
-                </button>
-                <button
-                  onClick={() => setSearchProvider('semantic_scholar')}
-                  disabled={researchMode === 'local'}
-                  className={`flex-1 py-1.5 text-xs font-bold rounded flex items-center justify-center gap-2 transition-all ${searchProvider === 'semantic_scholar' ? 'bg-cyan-600 text-white' : 'text-zinc-500 hover:text-zinc-300'} ${researchMode === 'local' ? 'opacity-30' : ''}`}
-                  title="Semantic Scholar (Academic Only)"
-                >
-                  <GraduationCap className="w-3 h-3" /> Academic
-                </button>
-              </div>
-              {aiProvider === 'ollama' && (
+              <select
+                className="w-full bg-slate-800 border-none rounded p-2 text-white outline-none focus:border-cyan-500"
+                value={searchProvider}
+                onChange={(e) => setSearchProvider(e.target.value as SearchProvider)}
+              >
+                <option value="semantic_scholar">Semantic Scholar (Recommended)</option>
+                <option value="google_scholar">Google Scholar (Experimental)</option>
+                <option value="google">Standard Google Search</option>
+              </select>
+
+              {aiProvider === 'ollama' && searchProvider === 'google' && (
                 <div className="text-[10px] text-orange-400 mt-1">
-                  * Ollama is restricted to Semantic Scholar for external data to ensure accurate citations.
+                  * Ollama cannot use Standard Google Search. Please use Semantic Scholar or Google Scholar with Proxy.
                 </div>
               )}
             </div>
 
-            {/* Search Filters */}
-            {searchProvider === 'semantic_scholar' && (
+            {/* Search Filters (Scholars) */}
+            {(searchProvider === 'semantic_scholar' || searchProvider === 'google_scholar') && (
               <div className="space-y-2 bg-zinc-950/50 p-2 rounded border border-zinc-800/50">
                 <label className="text-xs text-cyan-400 font-mono uppercase flex items-center gap-1">
                   <Filter className="w-3 h-3" /> Academic Filters
@@ -624,9 +619,6 @@ const App: React.FC = () => {
                     onChange={(e) => setScanDepth(parseInt(e.target.value))}
                     className="w-full h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
                   />
-                  <div className="text-[9px] text-zinc-500 text-right mt-1">
-                    Deep Scan (Slow)
-                  </div>
                 </div>
               </div>
             )}
@@ -1015,6 +1007,9 @@ const App: React.FC = () => {
               onRegenerate={handleRegenerateAnalysis}
               onGenerateReport={handleGenerateDetailedReport}
               isRegenerating={isRegenerating}
+              apiKey={apiKey}
+              provider={aiProvider}
+              ollamaConfig={{ baseUrl: ollamaUrl, model: ollamaModel }}
             />
           </div>
         </div>

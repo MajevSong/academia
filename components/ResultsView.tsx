@@ -20,6 +20,10 @@ interface ResultsViewProps {
   onRegenerate: () => void;
   onGenerateReport: () => void;
   isRegenerating: boolean;
+  // AI Context
+  apiKey: string;
+  provider: string; // 'gemini' | 'ollama'
+  ollamaConfig?: { model: string; baseUrl: string };
 }
 
 interface CitationButtonProps {
@@ -59,11 +63,6 @@ const COLORS = [
   '#f43f5e', // Rose
 ];
 
-const SCI_HUB_MIRRORS = [
-  'https://sci-hub.se',
-  'https://sci-hub.st',
-  'https://sci-hub.ru'
-];
 
 const CitationGraph: React.FC<{ papers: Paper[] }> = ({ papers }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -593,12 +592,70 @@ const CitationButton: React.FC<CitationButtonProps> = ({ paper, index, onClick }
   </button>
 );
 
-const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, finalLatex, documents, setDocuments, onRegenerate, onGenerateReport, isRegenerating }) => {
+const ResultsView: React.FC<ResultsViewProps> = ({
+  librarianResult,
+  dataResult,
+  finalLatex,
+  documents,
+  setDocuments,
+  onRegenerate,
+  onGenerateReport,
+  isRegenerating,
+  apiKey,
+  provider,
+  ollamaConfig
+}) => {
   const [activeTab, setActiveTab] = useState<'paper' | 'gap' | 'sources' | 'data' | 'network'>('paper');
   const [copied, setCopied] = useState(false);
   const [gapCopied, setGapCopied] = useState(false);
   const [selectedCitation, setSelectedCitation] = useState<Paper | null>(null);
   const [fetchingAbstractId, setFetchingAbstractId] = useState<number | null>(null);
+  const [enhancedSummaries, setEnhancedSummaries] = useState<{ [key: number]: string }>({});
+
+  // AUTOMATIC ABSTRACT FETCHING SEQ
+  useEffect(() => {
+    if (!librarianResult?.papers || librarianResult.papers.length === 0) return;
+
+    let isMounted = true;
+    const papers = librarianResult.papers;
+
+    const fetchSequence = async () => {
+      // We process sequentially to avoid blocking
+      for (let i = 0; i < papers.length; i++) {
+        if (!isMounted) break;
+
+        // Skip if we already have it locally
+        if (enhancedSummaries[i]) continue;
+
+        // Skip if the summary is already long (e.g. valid abstract)
+        // But user said "Fetch abstracta ihtiyaç duymadan...". Snippets are usually short.
+
+        setFetchingAbstractId(i);
+        try {
+          const fetchedAbstract = await fetchAbstractFromUrl(
+            papers[i].url,
+            provider as any,
+            provider === 'ollama' ? ollamaConfig : undefined,
+            apiKey
+          );
+
+          if (isMounted && fetchedAbstract && fetchedAbstract.length > 100 && fetchedAbstract !== "NO_ABSTRACT_FOUND") {
+            setEnhancedSummaries(prev => ({ ...prev, [i]: fetchedAbstract }));
+          }
+        } catch (e) {
+          // Silent fail, just move to next
+        }
+
+        // Polite delay to avoid 429
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      if (isMounted) setFetchingAbstractId(null);
+    };
+
+    fetchSequence();
+
+    return () => { isMounted = false; };
+  }, [librarianResult, apiKey, provider]);
 
   // New State for Data Tab Management
   // Removed local 'documents' state, using props instead
@@ -702,29 +759,24 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
     setActiveDataSubTab('docs');
 
     // Helper: Attempt to download from a specific URL
-    const attemptDownload = async (targetUrl: string, isSciHub: boolean): Promise<DownloadedDocument | null> => {
+    const attemptDownload = async (targetUrl: string): Promise<DownloadedDocument | null> => {
       try {
         let response: Response;
 
-        // A. FETCHING STRATEGY
-        if (isSciHub || targetUrl.includes('sci-hub')) {
-          // Sci-Hub Proxy Route
-          const path = targetUrl.replace(/^https?:\/\/(www\.)?sci-hub\.[a-z]+(\/)?/, '');
-          response = await fetch(`/api/scihub/${path}`);
-        } else {
-          // Standard URL - Try Direct first, then Generic Proxy
-          try {
-            const directCheck = await fetch(targetUrl, { method: 'HEAD' });
-            if (directCheck.ok) {
-              response = await fetch(targetUrl);
-            } else {
-              throw new Error("Direct fetch failed");
-            }
-          } catch (directError) {
-            // Fallback to Proxy
-            console.log(`Direct access to ${targetUrl} failed, trying proxy...`);
-            response = await fetch(`/api/proxy?url=${encodeURIComponent(targetUrl)}`);
+        // Standard URL - Try Direct first, then Generic Proxy
+        try {
+          // Quick HEAD check if possible? Actually just try GET to avoid CORS preflight issues sometimes
+          // Or stick to current strategy:
+          const directCheck = await fetch(targetUrl, { method: 'HEAD' });
+          if (directCheck.ok) {
+            response = await fetch(targetUrl);
+          } else {
+            throw new Error("Direct fetch failed");
           }
+        } catch (directError) {
+          // Fallback to Proxy
+          console.log(`Direct access to ${targetUrl} failed, trying proxy...`);
+          response = await fetch(`/api/proxy?url=${encodeURIComponent(targetUrl)}`);
         }
 
         if (!response || !response.ok) return null;
@@ -756,19 +808,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
           const htmlText = await response.text();
           let finalHtml = htmlText;
 
-          if (isSciHub || targetUrl.includes('sci-hub')) {
-            const pdfSrcMatch = htmlText.match(/<iframe.*?src=["'](.*?)["']/i) || htmlText.match(/<embed.*?src=["'](.*?)["']/i);
-            if (pdfSrcMatch && pdfSrcMatch[1]) {
-              let pdfDirectUrl = pdfSrcMatch[1];
-              if (pdfDirectUrl.startsWith('//')) pdfDirectUrl = 'https:' + pdfDirectUrl;
-              if (!pdfDirectUrl.includes('sci-hub')) {
-                const mirrorBase = SCI_HUB_MIRRORS[0];
-                if (pdfDirectUrl.startsWith('/')) pdfDirectUrl = mirrorBase + pdfDirectUrl;
-              }
-              // Recursively try to download the scraped PDF link
-              return attemptDownload(pdfDirectUrl, true);
-            }
-          }
+          // Scraper logic removed as per user request
 
           // If it's a regular Publisher HTML page, we still save it, but maybe prioritize Sci-Hub later?
           // For now, return the HTML doc.
@@ -819,7 +859,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
 
       if (paper.url && !isGenericDoi) {
         console.log("Attempt 1: Verified Source URL", paper.url);
-        finalDoc = await attemptDownload(paper.url, false);
+        finalDoc = await attemptDownload(paper.url);
       }
 
       // ATTEMPT 2: Sci-Hub Fallback
@@ -828,17 +868,8 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
       // But for now, if Attempt 1 succeeded with HTML, we keep it, UNLESS the user explicitly wants PDF priority.
       // Let's assume if Attempt 1 returned NULL, we try Sci-Hub.
 
-      if ((!finalDoc || finalDoc.type === 'html') && paper.doi) {
-        console.log("Attempt 2: Sci-Hub Fallback");
-        const sciHubUrl = `${SCI_HUB_MIRRORS[0]}/${paper.doi}`;
-        const sciHubDoc = await attemptDownload(sciHubUrl, true);
-
-        // If Sci-Hub gave us a PDF, definitely use that over any HTML we might have found
-        if (sciHubDoc && sciHubDoc.type === 'pdf') {
-          finalDoc = sciHubDoc;
-        } else if (!finalDoc && sciHubDoc) {
-          finalDoc = sciHubDoc; // Use Sci-Hub HTML if we had nothing else
-        }
+      if ((!finalDoc || finalDoc.type === 'html')) {
+        // Fallback removed as per user request (No Sci-Hub)
       }
 
       if (finalDoc) {
@@ -848,16 +879,22 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
         // Ultimate Fallback: Just Link
         throw new Error("All download attempts failed");
       }
-
     } catch (error) {
-      console.error("All strategies failed", error);
+      // Silent fallback
       const docId = Math.random().toString(36).substring(7);
+      const isPdf = paper.url?.toLowerCase().includes('.pdf');
+
+      // Use Google Docs Viewer for PDFs to bypass "Force Download" headers and X-Frame-Options
+      const viewerUrl = isPdf
+        ? `https://docs.google.com/gview?url=${encodeURIComponent(paper.url || "")}&embedded=true`
+        : (paper.url || "");
+
       const newDoc: DownloadedDocument = {
         id: docId,
         paperId: index,
         title: paper.title,
-        type: 'link',
-        content: paper.url || "",
+        type: 'pdf', // Force 'pdf' type so it uses <iframe src="..."> instead of srcDoc
+        content: viewerUrl,
         originalUrl: paper.url || "",
         timestamp: new Date().toLocaleTimeString()
       };
@@ -877,8 +914,14 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
   const handleFetchAbstract = async (paper: Paper, index: number) => {
     setFetchingAbstractId(index);
     try {
-      const fullAbstract = await fetchAbstractFromUrl(paper.url, 'gemini'); // Default to gemini for speed
-      if (fullAbstract && fullAbstract.length > 50) {
+      const fullAbstract = await fetchAbstractFromUrl(
+        paper.url,
+        provider as any,
+        provider === 'ollama' ? ollamaConfig : undefined,
+        apiKey
+      );
+
+      if (fullAbstract && fullAbstract.length > 50 && fullAbstract !== "NO_ABSTRACT_FOUND") {
         if (librarianResult) {
           librarianResult.papers[index].summary = fullAbstract; // Mutate local result for immediate view
         }
@@ -1272,18 +1315,40 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
                     </div>
                     <div className="flex-1 bg-white relative">
                       {selectedDoc.type === 'pdf' ? (
-                        <iframe src={selectedDoc.content} className="w-full h-full border-none" title="PDF Viewer" />
+                        <div className="relative w-full h-full">
+                          <iframe src={selectedDoc.content} className="w-full h-full border-none" title="PDF Viewer" />
+                          <a
+                            href={selectedDoc.content}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="absolute top-4 right-4 bg-zinc-900/80 text-white p-2 rounded-full hover:bg-emerald-600 transition-colors shadow-lg backdrop-blur-sm z-10"
+                            title="Open in New Tab (If blocked)"
+                          >
+                            <ExternalLink size={20} />
+                          </a>
+                        </div>
                       ) : (
                         selectedDoc.type === 'html' ? (
-                          <iframe srcDoc={selectedDoc.content} className="w-full h-full border-none" title="HTML Viewer" sandbox="allow-same-origin allow-scripts" />
+                          <iframe srcDoc={selectedDoc.content} className="w-full h-full border-none" title="HTML Viewer" />
                         ) : (
-                          <div className="flex flex-col items-center justify-center h-full bg-zinc-100 text-zinc-800 p-8 text-center">
-                            <Info className="w-12 h-12 mb-4 text-zinc-400" />
-                            <h3 className="font-bold mb-2">External Link Saved</h3>
-                            <p className="text-sm mb-4">This document could not be embedded due to publisher security settings.</p>
-                            <a href={selectedDoc.content} target="_blank" rel="noopener noreferrer" className="bg-indigo-600 text-white px-4 py-2 rounded text-sm hover:bg-indigo-700 transition-colors">
-                              Open in New Tab
+                          <div className="flex flex-col items-center justify-center h-full bg-zinc-900 text-zinc-300 p-8 text-center border border-zinc-800 rounded mx-4 my-4">
+                            <ShieldCheck className="w-16 h-16 mb-4 text-emerald-500" />
+                            <h3 className="font-bold text-xl mb-2 text-white">Publisher Security Active</h3>
+                            <p className="text-sm text-zinc-400 mb-6 max-w-md">
+                              This document cannot be embedded directly due to security settings. However, you can access the full PDF safely via the verified source link below.
+                            </p>
+                            <a
+                              href={selectedDoc.content}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-3 rounded-lg font-bold text-sm transition-all flex items-center gap-2 shadow-lg shadow-emerald-900/20 hover:scale-105"
+                            >
+                              <ExternalLink size={18} />
+                              Open Verified Source (PDF)
                             </a>
+                            <div className="mt-8 p-3 bg-zinc-950/50 rounded text-xs text-zinc-500 font-mono break-all max-w-xs">
+                              {selectedDoc.content}
+                            </div>
                           </div>
                         )
                       )}
@@ -1347,8 +1412,13 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
                         </h5>
                         <p className="text-xs font-mono text-zinc-500 mb-2">{paper.authors} ({paper.year})</p>
                         <div className="relative group/abstract">
-                          <p className={`text-sm text-zinc-400 mb-2 transition-all duration-300 ${paper.summary.length > 300 ? 'line-clamp-2 hover:line-clamp-none cursor-pointer bg-zinc-900/50 p-2 rounded hover:bg-zinc-800' : ''}`} title="Hover to expand">
-                            {paper.summary}
+                          <p className={`text-sm text-zinc-400 mb-2 transition-all duration-300 ${paper.summary.length > 300 || enhancedSummaries[idx]?.length > 300 ? 'line-clamp-2 hover:line-clamp-none cursor-pointer bg-zinc-900/50 p-2 rounded hover:bg-zinc-800' : ''}`} title="Hover to expand">
+                            {enhancedSummaries[idx] || paper.summary}
+                            {fetchingAbstractId === idx && !enhancedSummaries[idx] && (
+                              <span className="ml-2 inline-flex items-center text-xs text-emerald-500 animate-pulse">
+                                <Loader size={10} className="animate-spin mr-1" /> Expanding...
+                              </span>
+                            )}
                           </p>
                         </div>
 
@@ -1369,27 +1439,6 @@ const ResultsView: React.FC<ResultsViewProps> = ({ librarianResult, dataResult, 
                             </span>
                           )}
 
-                          <button
-                            onClick={() => handleFetchAbstract(paper, idx)}
-                            disabled={fetchingAbstractId === idx}
-                            className="text-[10px] bg-amber-900/20 text-amber-500 hover:text-white hover:bg-amber-600 px-2 py-1 rounded border border-amber-500/30 transition-colors cursor-pointer flex items-center gap-1.5"
-                            title="Scrape Full Abstract from URL"
-                          >
-                            {fetchingAbstractId === idx ? <Loader size={12} className="animate-spin" /> : <Sparkles size={12} />}
-                            {fetchingAbstractId === idx ? 'Scraping...' : 'Fetch Abstract'}
-                          </button>
-
-                          {paper.doi && (
-                            <a
-                              href={`https://sci-hub.se/${paper.doi}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-[10px] bg-indigo-900/20 text-indigo-400 hover:text-white hover:bg-indigo-600 px-2 py-1 rounded border border-indigo-500/30 transition-colors cursor-pointer flex items-center gap-1.5"
-                              title="Access PDF via Sci-Hub"
-                            >
-                              <Unlock size={12} /> Sci-Hub
-                            </a>
-                          )}
 
                           <div className="flex-1"></div>
 

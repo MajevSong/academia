@@ -15,13 +15,13 @@ export enum AppState {
   GHOSTWRITER = 'GHOSTWRITER',
   REVIEWER = 'REVIEWER',
   // New State for Lit Review Mode
-  LIT_REVIEW_WRITER = 'LIT_REVIEW_WRITER', 
+  LIT_REVIEW_WRITER = 'LIT_REVIEW_WRITER',
   FINISHED = 'FINISHED'
 }
 
 export type ResearchScope = 'full_paper' | 'lit_review';
 export type AIProvider = 'gemini' | 'ollama';
-export type SearchProvider = 'google' | 'semantic_scholar';
+export type SearchProvider = 'google' | 'semantic_scholar' | 'google_scholar';
 
 export interface SearchFilters {
   minYear?: string;
