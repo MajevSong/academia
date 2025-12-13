@@ -318,15 +318,20 @@ const searchSemanticScholar = async (query: string, filters?: SearchFilters, max
         .map((p: any) => {
           const authorList = p.authors.map((a: any) => a.name).join(", ");
           const openAccessUrl = p.openAccessPdf?.url;
-          const doiLink = `https://doi.org/${p.externalIds.DOI}`;
-          const finalUrl = openAccessUrl || doiLink;
+          const doiLink = p.externalIds?.DOI ? `https://doi.org/${p.externalIds.DOI}` : null;
+          // Prefer official URL or DOI for the "Source" link (Landing Page)
+          const landingPageUrl = p.url || doiLink || openAccessUrl;
+          const semanticReaderLink = p.paperId ? `https://www.semanticscholar.org/reader/${p.paperId}` : null;
 
           return {
             title: p.title,
             authors: authorList,
             year: p.year ? p.year.toString() : "N/A",
             doi: p.externalIds.DOI,
-            url: finalUrl,
+            url: landingPageUrl,
+            openAccessPdf: openAccessUrl, // Explicitly store the direct PDF link for value-add downloads
+            semanticReaderLink: semanticReaderLink,
+            // Fallback chain: Abstract -> TLDR -> Placeholder
             // Fallback chain: Abstract -> TLDR -> Placeholder
             summary: p.abstract || (p.tldr ? p.tldr.text : "No abstract available.")
           };
@@ -455,8 +460,11 @@ export const runLibrarianAgent = async (
     } catch (e) { return { papers: [], researchGap: "Local analysis failed." }; }
   }
 
-  // SEMANTIC SCHOLAR STRATEGY
-  if (searchProvider === 'semantic_scholar') {
+  // SEMANTIC SCHOLAR STRATEGY (Default for Academic / Ollama)
+  // We prefer Semantic Scholar for all academic queries unless explicitly Google
+  const useSemantic = searchProvider === 'semantic_scholar' || searchProvider === 'semantic' || provider === 'ollama';
+
+  if (useSemantic) {
     const targetDepth = filters.scanDepth || 50;
     let aggregatedPapers: Paper[] = [];
     const seenTitles = new Set<string>();
@@ -538,60 +546,167 @@ export const runDataScientistAgent = async (topic: string, gap: string, userCont
 };
 
 // --- Abstract Scraper (On-Demand) ---
+const fetchedUrlsCache = new Map<string, number>();
+
 export const fetchAbstractFromUrl = async (targetUrl: string, provider: AIProvider, ollamaConfig?: OllamaConfig, apiKey?: string): Promise<string> => {
+  // CIRCUIT BREAKER: Prevent Infinite Loops
+  const now = Date.now();
+  if (fetchedUrlsCache.has(targetUrl)) {
+    const lastFetch = fetchedUrlsCache.get(targetUrl)!;
+    if (now - lastFetch < 30000) { // Block requests to same URL within 30 seconds
+      console.warn(`[Circuit Breaker] Blocked frequent request to: ${targetUrl}`);
+      return "NO_ABSTRACT_FOUND"; // Return safe fallback to stop processing
+    }
+  }
+  fetchedUrlsCache.set(targetUrl, now);
+
   try {
+    console.log(`[Debug] START Fetching abstract for: ${targetUrl}`);
     // 1. Fetch HTML via Proxy
     // We treat it as a generic proxy request
     const proxyUrl = `/api/proxy?url=${encodeURIComponent(targetUrl)}`;
     const res = await fetch(proxyUrl);
 
+    console.log(`[Debug] Status: ${res.status} | OK: ${res.ok}`);
+    if (!res.ok) {
+      console.log(`[Debug] Fetch failed logic triggered.`);
+    }
+
     let htmlText = "";
     try {
       htmlText = await res.text();
+      console.log(`[Debug] HTML Content Length: ${htmlText.length}`);
+      console.log(`[Debug] Contains 'Abstract' keyword: ${htmlText.includes('Abstract')}`);
+      console.log(`[Debug] Contains 'TLDR' keyword: ${htmlText.includes('TLDR')}`);
     } catch (e) {
       console.warn("Failed to read text:", e);
     }
 
-    // CHECK FOR CLOUDFLARE / AKAMAI BLOCKS
+    // CHECK FOR CLOUDFLARE / AKAMAI / BOT BLOCKS
     const isBlocked = htmlText.includes("Please contact our support team") ||
       htmlText.includes("Reference number:") ||
       htmlText.includes("Cloudflare Ray ID") ||
-      res.status === 403 || res.status === 504 || res.status === 401;
+      htmlText.includes("challenge-container") || // New: Cloudflare turnstile/challenge
+      htmlText.includes("JavaScript is disabled") || // New: JS challenge
+      htmlText.includes("verify that you're not a robot") ||
+      res.status === 403 || res.status === 504 || res.status === 401 || res.status === 429;
 
     if (isBlocked) {
+      console.warn(`[Abstract Fetch] Blocked by Publisher Security (Status: ${res.status}). Pattern detected.`);
+      // We can try Google Cache if we haven't already, or just stop.
+      // For now, let's try the cache fallback logic if it exists below, otherwise return.
       console.log("Publisher Security Block Detected. Attempting Google Cache Fallback...");
       try {
         const cacheUrl = `http://webcache.googleusercontent.com/search?q=cache:${encodeURIComponent(targetUrl)}`;
         // Use the same proxy to fetch the cache
         const cacheResponse = await fetch(`/api/proxy?url=${encodeURIComponent(cacheUrl)}`);
         if (cacheResponse.ok) {
-          htmlText = await cacheResponse.text();
+          const cacheText = await cacheResponse.text();
+          // Only use cache if it looks like real content
+          if (cacheText.length > 2000 && !cacheText.includes("404. That’s an error")) {
+            htmlText = cacheText;
+            console.log("Google Cache Hit!");
+          } else {
+            return "NO_ABSTRACT_FOUND"; // Abort
+          }
+        } else {
+          return "NO_ABSTRACT_FOUND"; // Abort
         }
       } catch (e) {
         console.warn("Cache fallback failed", e);
+        return "NO_ABSTRACT_FOUND";
       }
     } else if (!res.ok) {
-      throw new Error(`Failed to fetch content (Status: ${res.status})`);
+      // throw new Error(`Failed to fetch content (Status: ${res.status})`);
+      console.warn(`Fetch failed with status ${res.status}`);
+      return "NO_ABSTRACT_FOUND";
     }
 
-    // Strip minimal tags to reduce token usage, but keep structure
-    const cleanedHtml = htmlText.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gmi, "")
+    // 1. Attempt to extract JSON-LD (Rich Metadata)
+    let jsonLdData = "";
+    const jsonLdCheck = htmlText.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/gmi);
+    console.log(`[Debug] Checking JSON-LD... Found: ${!!jsonLdCheck}`);
+    if (jsonLdCheck) {
+      jsonLdData = jsonLdCheck.map(script => script.replace(/<[^>]+>/g, '')).join("\n\n");
+      // Check if JSON-LD itself contains the description/abstract directly
+      const abstractMatch = jsonLdData.match(/"(description|abstract)"\s*:\s*"([^"]+)"/i);
+      if (abstractMatch && abstractMatch[2].length > 100) {
+        console.log("Found abstract in JSON-LD!");
+        return abstractMatch[2];
+      }
+    }
+
+    // 2. META TAG SCRAPING (High Reliability)
+    // Often the abstract is in the meta description
+    console.log(`[Debug] Checking Meta Tags... Found match: ${!!htmlText.match(/<meta\s+(?:name|property)=["'](?:description|og:description|twitter:description)["']\s+content=["']([^"']+)["']/i)}`);
+    const metaRegex = /<meta\s+(?:name|property)=["'](?:description|og:description|twitter:description)["']\s+content=["']([^"']+)["']/i;
+    const metaMatch = htmlText.match(metaRegex);
+    if (metaMatch && metaMatch[1] && metaMatch[1].length > 100) {
+      console.log("Found abstract in Meta Tags!");
+      return metaMatch[1];
+    }
+
+    // 3. HYDRATION DATA / RAW JSON SCRAPING (Brute Force)
+    // Many React apps (Semantic Scholar) hide data in window.__INITIAL_STATE__
+    // We look for any JSON key "abstract": "..."
+    console.log(`[Debug] Checking Raw JSON... Found match: ${!!htmlText.match(/"abstract"\s*:\s*"((?:[^"\\]|\\.)*)"/i)}`);
+    const rawJsonRegex = /"abstract"\s*:\s*"((?:[^"\\]|\\.)*)"/i;
+    const rawMatch = htmlText.match(rawJsonRegex);
+    if (rawMatch && rawMatch[1]) {
+      // Unescape the JSON string
+      let rawAbstract = rawMatch[1].replace(/\\"/g, '"').replace(/\\n/g, ' ').replace(/\\/g, '');
+      if (rawAbstract.length > 100 && !rawAbstract.includes("NO_ABSTRACT")) {
+        console.log("Found abstract in Raw JSON/Hydration script!");
+        return rawAbstract;
+      }
+    }
+
+    // 4. Targeted HTML Scraping (User Requested: "tldr-abstract-replacement")
+    // We try to find the specific class and extract text without AI to save resources.
+    const specificClasses = ["tldr-abstract-replacement", "paper-detail-page__abstract", "abstract-text"];
+
+    for (const className of specificClasses) {
+      // Enhanced regex to catch the class content more aggressively (multi-line, attributes)
+      // Matches: <div ... class="...tldr-s..." ... > ...CONTENT... </div>
+      const regex = new RegExp(`<div[^>]*class=["'][^"']*${className}[^"']*["'][^>]*>([\\s\\S]*?)<\\/div>`, "i");
+      const match = htmlText.match(regex);
+      if (match && match[1]) {
+        // Clean tags but keep text
+        const rawText = match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+        // If we found a substantial amount of text, TRUST IT.
+        if (rawText.length > 50 && !rawText.toLowerCase().includes("tldr")) {
+          console.log(`Matched abstract via class: ${className}`);
+          return rawText; // Direct return, skip AI
+        }
+      }
+    }
+
+    // Strip purely technical tags to reduce token usage, BUT keep structure
+    const cleanedHtml = htmlText
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gmi, "")
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gmi, "")
-      .replace(/<!--[\s\S]*?-->/g, "")
-      .slice(0, 30000); // Limit context
+      .replace(/<!--[\s\S]*?-->/g, "") // Remove comments
+      .slice(0, 20000); // 20k chars is enough for header/abstract
 
     const prompt = `
-    TASK: Analyze the following web page content to extract or generate a comprehensive summary of the academic paper.
+    ROLE: HTML Content Extractor.
+    TASK: Extract the text content of the academic paper abstract from the provided HTML.
 
-    RULES:
-    1. Look for an explicit "Abstract" section first. If found, extract it VERBATIM.
-    2. If NO explicit abstract is found, YOU MUST GENERATE A SUMMARY based on the Introduction, Methods, and Conclusion sections present in the text.
-    3. The output must be a single cohesive paragraph (200-300 words).
-    4. Start with "[Extracted]" if found verbatim, or "[Generated Summary]" if you had to summarize it.
-    5. Do NOT return "NO_ABSTRACT_FOUND". Always return content.
+    CRITICAL INSTRUCTION:
+    - Look for "tldr-abstract-replacement" or "abstract" class/id.
+    - EXTRACT THE TEXT CONTENT INSIDE IT.
+    - Do NOT evaluate if it is "visible" or "dynamic". Just extract the text.
+    - Do NOT output "NO_ABSTRACT_FOUND" if you see the "tldr-abstract-replacement" tag.
+    - Ignore "TLDR" summaries. We need the FULL Abstract.
+    - **NEVER OUTPUT CODE**. Do NOT write a Python script or Regex. Output ONLY the extracted text.
 
-    Web Content:
+    INPUT HTML (Truncated):
     ${cleanedHtml}
+
+    OUTPUT:
+    - Just the plain text of the abstract.
+    - If absolutely nothing found, return "NO_ABSTRACT_FOUND".
     `;
 
     let abstract = "";
@@ -607,10 +722,9 @@ export const fetchAbstractFromUrl = async (targetUrl: string, provider: AIProvid
     }
 
     return abstract.trim();
-
   } catch (e) {
     console.error("Abstract scraping failed:", e);
-    return "";
+    return "NO_ABSTRACT_FOUND";
   }
 };
 
@@ -734,6 +848,55 @@ export const generateDeepLiteratureAnalysis = async (
   }
 };
 
+// --- HELPER: DEFAULT PROMPT GENERATOR (APA CITATION ENGINE) ---
+export const getDefaultReportPrompt = (topic: string, paperCount: number) => `
+You are an academic processing and citation engine.
+
+CRITICAL RULES (ABSOLUTE - VIOLATION IS FAILURE):
+1. ABSTRACT PRESERVATION: Use the abstracts EXACTLY as they appear in the data.
+   - Do NOT paraphrase, rewrite, summarize, or alter wording in any way.
+   - Preserve original sentence order and content.
+   - If abstract is English, keep it English. If Turkish, keep Turkish.
+
+2. SENTENCE-LEVEL APA CITATIONS:
+   - Append an APA 7 in-text citation to the END of EVERY sentence.
+   - Format: (AuthorLastName, Year) or (Author1 & Author2, Year) or (FirstAuthor et al., Year)
+
+3. OUTPUT FORMAT:
+   - Create a clean academic report compiling the provided abstracts.
+   - For each source, create a section with the paper title as heading.
+   - Copy the abstract text VERBATIM, adding citations after each sentence.
+
+4. REFERENCES SECTION:
+   - Generate APA 7 formatted reference list at the end.
+   - Include all sources cited in the text.
+   - Sort alphabetically by first author's last name.
+
+CONSTRAINTS (DO NOT VIOLATE):
+- Do NOT invent or infer content.
+- Do NOT add external knowledge.
+- Do NOT translate or modify the abstract text.
+- If metadata is missing, state what is missing.
+
+OUTPUT LANGUAGE: Same as input abstracts (preserve original language).
+
+OUTPUT STRUCTURE:
+# Literature Review: ${topic}
+
+## [Paper Title 1]
+[Verbatim abstract with (Author, Year) after each sentence]
+
+## [Paper Title 2]
+[Verbatim abstract with (Author, Year) after each sentence]
+
+...
+
+# References
+[APA 7 formatted reference list]
+
+PROCESS ALL ${paperCount} SOURCES PROVIDED.
+`;
+
 // --- NEW: DETAILED BIBLIOGRAPHIC REPORT ---
 export const generateDetailedBibliographicReport = async (
   topic: string,
@@ -741,74 +904,41 @@ export const generateDetailedBibliographicReport = async (
   documents: DownloadedDocument[],
   provider: AIProvider,
   ollamaConfig: OllamaConfig,
-  apiKey?: string
+  apiKey?: string,
+  customPrompt?: string // NEW ARGUMENT
 ): Promise<string> => {
   try {
-    // 1. Prepare Data Context
+    // 1. Prepare Data Context - EXPLICIT FORMATTING FOR VERBATIM COPY
     const paperContexts = papers.map((paper, index) => {
       // Try to find full text
       const doc = documents.find(d => d.title === paper.title || d.originalUrl === paper.url);
       const hasFullText = !!(doc && doc.textContent && doc.textContent.length > 500);
-      const content = hasFullText ? doc!.textContent : paper.summary;
+      const abstractText = paper.summary || "";
+      const fullText = hasFullText ? doc!.textContent : null;
 
       return `
-PAPER #${index + 1}:
-Title: ${paper.title}
-Authors: ${paper.authors}
-Year: ${paper.year}
+================================================================================
+SOURCE #${index + 1}
+================================================================================
+TITLE: ${paper.title}
+AUTHORS: ${paper.authors}
+YEAR: ${paper.year}
+DOI: ${paper.doi || "N/A"}
 URL: ${paper.url}
-Source Type: ${hasFullText ? "FULL TEXT PROVIDED" : "ABSTRACT ONLY"}
-Content:
-${(content || "").slice(0, 15000)} // Truncate very long texts to fit context window if needed
---------------------------------------------------
+--------------------------------------------------------------------------------
+*** ABSTRACT TEXT (COPY THIS VERBATIM - DO NOT PARAPHRASE OR TRANSLATE) ***
+"""
+${abstractText.slice(0, 8000)}
+"""
+--------------------------------------------------------------------------------
+${hasFullText ? `[FULL TEXT AVAILABLE - ${fullText!.length} chars]
+${fullText!.slice(0, 12000)}` : "[NO FULL TEXT - USE ABSTRACT ABOVE]"}
+================================================================================
 `;
     }).join('\n');
 
-    const prompt = `
-GÖREV: Aşağıdaki makaleleri ve kaynakları kullanarak "${topic}" konusu üzerine "Detaylı Literatür Taraması Raporu" oluştur.
-
-TALİMATLAR:
-1. Listede verilen HER BİR makale için ayrı ve detaylı bir özet yaz.
-2. "FULL TEXT PROVIDED" (Tam Metin) olanlar için:
-   - Makale içeriğini derinlemesine analiz et.
-   - Sadece genel bir özet yazma; çalışmanın Amacı, Yöntemi, Bulguları ve Sonuçları gibi ana başlıkları detaylandır.
-   - METİNDEKİ ÖNEMLİ NOKTALARI VE VERİLERİ (Örn: % oranlar, p değerleri, istatistikler) mutlaka vurgula.
-   - En az 4-5 paragraflık kapsamlı bir inceleme olsun.
-
-3. "ABSTRACT ONLY" (Sadece Özet) olanlar için:
-   - Mevcut abstract metnini OLDUĞU GİBİ, KELİMESİ KELİMESİNE Türkçe'ye çevir.
-   - ASLA yorum katma, özetleme veya kısaltma.
-   - Metinde ne yazıyorsa birebir aynısı olsun. "Bu çalışma şunu amaçlar..." gibi dolaylı anlatım yerine, yazarın ağzından yazılmış gibi çevir.
-4. ÖNEMLİ FORMAT KURALI: Her özetin en başında mutlaka çalışmanın yazarlarından bahset. 
-   Örnek: "Yılmaz ve arkadaşları (2023) tarafından yapılan bu çalışmada..." veya "Smith (2022) bu araştırmasında..."
-
-5. METİN İÇİ ATIF:
-   Her makalenin özetinin sonuna, o makalenin Kaynakça listesindeki numarasına atıf ver.
-   Format: [ID: {sıra_numarası}]
-   Örnek: ...sonucuna varılmıştır. [ID: 1]
-
-6. Her makale için şu formatı TİTİZLİKLE uygula:
-
-## [Makale Başlığı]
-[Yazarlara atıfla başlayan, ABSTRACT metninin tamamını içeren detaylı içerik...]
-
-**Link**: [Çalışmanın orijinal URL adresini buraya https:// ile başlayacak şekilde yaz.]
-**Kaynak No**: [ID: {sıra_numarası}]
-
-7. Tüm makaleler bittikten sonra en sona şu başlığı ekle:
-# Kaynakça
-[Burada tüm kaynakları listele. HER KAYNAĞIN BAŞINA ÖZEL BİR ETİKET KOY.]
-
-Format:
-[[REF:{sıra_numarası}]] {Yazar Adları}. ({Yıl}). {Başlık}. {Yayın Yeri}. DOI:...
-
-Örnek:
-[[REF:1]] Yılmaz, A. (2023). Örnek Çalışma...
-[[REF:2]] Smith, J. (2022). Sample Study...
-
-Listelenen ${papers.length} makalenin HEPSİNİ işle.
-DİL: TÜRKÇE.
-    `;
+    // USE CUSTOM PROMPT IF PROVIDED, ELSE DEFAULT
+    const prompt = customPrompt || getDefaultReportPrompt(topic, papers.length);
 
     // 2. Call AI
     if (provider === 'gemini') {

@@ -21,7 +21,7 @@ export enum AppState {
 
 export type ResearchScope = 'full_paper' | 'lit_review';
 export type AIProvider = 'gemini' | 'ollama';
-export type SearchProvider = 'google' | 'semantic_scholar' | 'google_scholar';
+export type SearchProvider = 'google' | 'semantic_scholar' | 'semantic' | 'google_scholar';
 
 export interface SearchFilters {
   minYear?: string;
@@ -41,6 +41,8 @@ export interface Paper {
   doi: string;
   url: string;
   summary: string;
+  openAccessPdf?: string;
+  semanticReaderLink?: string;
 }
 
 export interface DownloadedDocument {
@@ -83,7 +85,7 @@ export interface LogEntry {
   timestamp: string;
   agent: string;
   message: string;
-  type: 'info' | 'success' | 'warning' | 'error';
+  type: 'info' | 'success' | 'warning' | 'error' | 'working';
 }
 
 export interface CognitoState {

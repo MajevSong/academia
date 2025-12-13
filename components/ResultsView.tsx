@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { LibrarianResult, DataScientistResult, Paper, DownloadedDocument } from '../types';
-import { extractTextFromPdf, fetchAbstractFromUrl } from '../services/geminiService';
+import { extractTextFromPdf, fetchAbstractFromUrl, getDefaultReportPrompt } from '../services/geminiService';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
 } from 'recharts';
@@ -8,8 +8,23 @@ import {
   FileText, Database, BookOpen, Copy, Check, ExternalLink, Info, X,
   ShieldCheck, Download, Sparkles, Network, Maximize2, Minimize2,
   ZoomIn, ZoomOut, RefreshCw, Camera, Move, Pause, Play, FileSpreadsheet,
-  ArrowRight, Loader, File, Trash2, Unlock, RefreshCcw
+  ArrowRight, Loader, File, Trash2, Unlock, RefreshCcw, Edit3, MessageSquare
 } from 'lucide-react';
+
+// GLOBAL STATE TO PERSIST ACROSS HMR (Prevents loops on code save)
+// This must be outside the component to survive re-renders and HMR updates
+const globalVisitedUrls = new Set<string>();
+let isGlobalLoopRunning = false;
+
+// SAFE STORAGE WRAPPER (Prevents "Access to storage not allowed" errors)
+const safeStorage = {
+  getItem: (key: string) => {
+    try { return sessionStorage.getItem(key); } catch (e) { return null; }
+  },
+  setItem: (key: string, value: string) => {
+    try { sessionStorage.setItem(key, value); } catch (e) { /* ignore */ }
+  }
+};
 
 interface ResultsViewProps {
   librarianResult: LibrarianResult | null;
@@ -24,12 +39,14 @@ interface ResultsViewProps {
   apiKey: string;
   provider: string; // 'gemini' | 'ollama'
   ollamaConfig?: { model: string; baseUrl: string };
+  addLog: (agent: string, message: string, type: 'info' | 'success' | 'warning' | 'error' | 'working') => void;
 }
 
 interface CitationButtonProps {
   paper: Paper;
   index: number;
-  onClick: () => void;
+  ollamaConfig?: { model: string; baseUrl: string };
+  addLog: (agent: string, message: string, type: 'info' | 'success' | 'warning' | 'error' | 'working') => void;
 }
 
 // --- FORCE DIRECTED GRAPH TYPES & COMPONENT ---
@@ -603,7 +620,8 @@ const ResultsView: React.FC<ResultsViewProps> = ({
   isRegenerating,
   apiKey,
   provider,
-  ollamaConfig
+  ollamaConfig,
+  addLog
 }) => {
   const [activeTab, setActiveTab] = useState<'paper' | 'gap' | 'sources' | 'data' | 'network'>('paper');
   const [copied, setCopied] = useState(false);
@@ -612,44 +630,168 @@ const ResultsView: React.FC<ResultsViewProps> = ({
   const [fetchingAbstractId, setFetchingAbstractId] = useState<number | null>(null);
   const [enhancedSummaries, setEnhancedSummaries] = useState<{ [key: number]: string }>({});
 
-  // AUTOMATIC ABSTRACT FETCHING SEQ
+  // PROMPT EDITOR STATE
+  const [showPromptModal, setShowPromptModal] = useState(false);
+  const [promptText, setPromptText] = useState('');
+
+  const openPromptModal = () => {
+    if (!librarianResult?.papers) return;
+    // We use a placeholder for topic since it's not passed, user can edit it.
+    const defaultP = getDefaultReportPrompt("RESEARCH TOPIC", librarianResult.papers.length);
+    setPromptText(defaultP);
+    setShowPromptModal(true);
+  };
+
+  // SAFE AUTOMATIC FETCHER
   useEffect(() => {
+    return; // OTOMATİK VERİ ÇEKME DEVRE DIŞI BIRAKILDI (Kullanıcı İsteği - Hafıza/Döngü Sorunu)
+
     if (!librarianResult?.papers || librarianResult.papers.length === 0) return;
+    if (isGlobalLoopRunning) return; // Prevent double-firing
 
     let isMounted = true;
     const papers = librarianResult.papers;
 
     const fetchSequence = async () => {
-      // We process sequentially to avoid blocking
+      isGlobalLoopRunning = true;
+      let fetchCount = 0;
+      let consecutiveErrors = 0; // Kill switch for network disconnects
+      const MAX_AUTO_FETCH = 50;
+      const DELAY_MS = 5000;
+
+      // PERSISTENCE: Try to load, but fallback to memory if blocked
+      let visitedSet = new Set<string>(); // Local working set
+
+      // 1. Merge global memory (HMR survival)
+      globalVisitedUrls.forEach(url => visitedSet.add(url));
+
+      // 2. Merge session storage (Reload survival)
+      try {
+        const stored = safeStorage.getItem('processed_paper_ids');
+        if (stored) {
+          const storedList = JSON.parse(stored);
+          storedList.forEach((url: string) => visitedSet.add(url));
+          storedList.forEach((url: string) => globalVisitedUrls.add(url)); // Sync back to global
+        }
+      } catch (e) {
+        console.warn("SessionStorage blocked. Using in-memory tracking only.");
+      }
+
+      console.log(`[Auto-Fetch] Starting... (Processed so far: ${visitedSet.size})`);
+
       for (let i = 0; i < papers.length; i++) {
         if (!isMounted) break;
+        if (fetchCount >= MAX_AUTO_FETCH) break;
 
-        // Skip if we already have it locally
-        if (enhancedSummaries[i]) continue;
+        // KILL SWITCH: If 3 in a row fail (likely network down or banned), STOP.
+        if (consecutiveErrors >= 3) {
+          console.error("[Auto-Fetch] Too many consecutive errors. Aborting sequence.");
+          break;
+        }
 
-        // Skip if the summary is already long (e.g. valid abstract)
-        // But user said "Fetch abstracta ihtiyaç duymadan...". Snippets are usually short.
+        const paper = papers[i];
+        const uniqueKey = paper.url || paper.title;
+
+        // CRITICAL SAFETY CHECK (Persistent)
+        if (visitedSet.has(uniqueKey) || globalVisitedUrls.has(uniqueKey)) {
+          // Check if we actually have text for it in the UI, if not, maybe we skip?
+          // The user wants "stop loops", so we strictly respect the visited flag.
+          continue;
+        }
+
+        // SMART CHECK
+        const currentText = paper.summary || "";
+        const isSuspiciousAndNeedsFetch =
+          currentText.length < 500 ||
+          currentText.trim().endsWith("...") ||
+          currentText.trim().endsWith("…") ||
+          currentText.toUpperCase().startsWith("TLDR") ||
+          currentText.includes("No abstract available");
+
+        if (enhancedSummaries[i] || (!isSuspiciousAndNeedsFetch)) {
+          visitedSet.add(uniqueKey);
+          globalVisitedUrls.add(uniqueKey);
+          // Try to save to storage (Safe Logic)
+          try {
+            safeStorage.setItem('processed_paper_ids', JSON.stringify(Array.from(visitedSet)));
+          } catch (e) { /* Ignore storage errors */ }
+          continue;
+        }
+
+        // FOUND ONE TO FETCH - Mark it immediately
+        visitedSet.add(uniqueKey);
+        globalVisitedUrls.add(uniqueKey);
+
+        // Try to save to storage (Safe Logic)
+        try {
+          safeStorage.setItem('processed_paper_ids', JSON.stringify(Array.from(visitedSet)));
+        } catch (e) { /* Ignore storage errors */ }
 
         setFetchingAbstractId(i);
+        fetchCount++;
+
+        console.log(`[Auto-Fetch] Processing ${i + 1}/${papers.length}: ${paper.title.substring(0, 30)}...`);
+
         try {
-          const fetchedAbstract = await fetchAbstractFromUrl(
-            papers[i].url,
+          // Attempt Fetch
+          let fullAbstract = await fetchAbstractFromUrl(
+            paper.url,
             provider as any,
             provider === 'ollama' ? ollamaConfig : undefined,
             apiKey
           );
 
-          if (isMounted && fetchedAbstract && fetchedAbstract.length > 100 && fetchedAbstract !== "NO_ABSTRACT_FOUND") {
-            setEnhancedSummaries(prev => ({ ...prev, [i]: fetchedAbstract }));
+          // Fallback logic for Semantic Reader
+          if ((!fullAbstract || fullAbstract === "NO_ABSTRACT_FOUND" || fullAbstract.length < 100) && paper.semanticReaderLink) {
+            const idMatch = paper.semanticReaderLink.match(/reader\/([a-f0-9]+)/);
+            if (idMatch && idMatch[1]) {
+              const fallbackUrl = `https://www.semanticscholar.org/paper/${idMatch[1]}`;
+              console.log("[Auto-Fetch] Trying Semantic Reader Fallback...");
+              await new Promise(r => setTimeout(r, 2000));
+              fullAbstract = await fetchAbstractFromUrl(
+                fallbackUrl,
+                provider as any,
+                provider === 'ollama' ? ollamaConfig : undefined,
+                apiKey
+              );
+            }
           }
+
+          if (isMounted) {
+            if (!fullAbstract || fullAbstract === "NO_ABSTRACT_FOUND") {
+              console.log(`[Auto-Fetch] Abstract not found for ${i}, using fallback summary.`);
+              fullAbstract = paper.summary || "Abstract not available.";
+            } else {
+              // Success! Reset consecutive errors
+              consecutiveErrors = 0;
+            }
+            setEnhancedSummaries(prev => ({ ...prev, [i]: fullAbstract! }));
+          }
+
         } catch (e) {
-          // Silent fail, just move to next
+          console.error("Auto-fetch error", e);
+          consecutiveErrors++; // Result: +1 error
+
+          if (isMounted) {
+            setEnhancedSummaries(prev => ({ ...prev, [i]: paper.summary || "Fetch failed." }));
+          }
+          console.log("[Auto-Fetch] Backing off...");
+          await new Promise(r => setTimeout(r, 5000));
         }
 
-        // Polite delay to avoid 429
-        await new Promise(r => setTimeout(r, 2000));
+        if (i < papers.length - 1) {
+          await new Promise(r => setTimeout(r, DELAY_MS));
+        }
       }
-      if (isMounted) setFetchingAbstractId(null);
+
+      if (isMounted) {
+        setFetchingAbstractId(null);
+        // Loop finished.
+        // We intentionally do NOT reset isGlobalLoopRunning here immediately to prevent HMR restart?
+        // Actually, we must allow restart if the user starts a NEW search.
+        // ideally isGlobalLoopRunning should be tied to 'librarianResult' ID, but for now:
+        isGlobalLoopRunning = false;
+      }
     };
 
     fetchSequence();
@@ -744,28 +886,22 @@ const ResultsView: React.FC<ResultsViewProps> = ({
   };
 
   // --- DOCUMENT DOWNLOAD LOGIC ---
+  // --- DOCUMENT DOWNLOAD LOGIC ---
   const handleDownloadPaper = async (paper: Paper, index: number) => {
-    // 1. Check if already downloaded
-    const existing = documents.find(d => d.paperId === index);
-    if (existing) {
-      setActiveTab('data');
-      setActiveDataSubTab('docs');
-      setSelectedDocId(existing.id);
-      return;
-    }
-
     setIsDownloading(true);
-    setActiveTab('data');
-    setActiveDataSubTab('docs');
+    setSelectedDocId(null);
+    addLog('LIBRARIAN', `Attempting to download: ${paper.title}`, 'working');
 
     // Helper: Attempt to download from a specific URL
-    const attemptDownload = async (targetUrl: string): Promise<DownloadedDocument | null> => {
+    const attemptDownload = async (targetUrl: string, depth: number = 0): Promise<DownloadedDocument | null> => {
+      if (depth > 1) return null; // Avoid infinite loops
+
       try {
         let response: Response;
 
         // Standard URL - Try Direct first, then Generic Proxy
         try {
-          // Quick HEAD check if possible? Actually just try GET to avoid CORS preflight issues sometimes
+          // Quick HEAD check if possible? Actually just try GET to avoid CORS preflight issues sometimes.
           // Or stick to current strategy:
           const directCheck = await fetch(targetUrl, { method: 'HEAD' });
           if (directCheck.ok) {
@@ -789,7 +925,6 @@ const ResultsView: React.FC<ResultsViewProps> = ({
           const blob = await response.blob();
           const blobUrl = URL.createObjectURL(blob);
           const extractedText = await extractTextFromPdf(blobUrl).catch(() => "");
-
           return {
             id: docId,
             paperId: index,
@@ -803,21 +938,39 @@ const ResultsView: React.FC<ResultsViewProps> = ({
         }
 
         if (contentType.includes('text/html')) {
-          // If we expected a PDF but got HTML (common with Sci-Hub or Publisher pages)
-          // If this was a Sci-Hub attempt, try to scrape the PDF iframe
           const htmlText = await response.text();
+
+          // SCRAPE FOR HIDDEN PDF LINKS (User Requested Feature)
+          // Look for "cl-paper-controls" or "reader-link" or "View PDF", or simpler: any /reader/ link
+          if (depth === 0) {
+            console.log("Checking for deep links...");
+            const readerMatch = htmlText.match(/href="([^"]*\/reader\/[^"]*)"/i) ||
+              htmlText.match(/href="([^"]*)"[^>]*class="[^"]*(?:cl-paper-action__reader-link)[^"]*"/i) ||
+              htmlText.match(/aria-label="Semantic Reader"[^>]*href="([^"]*)"/i);
+
+            if (readerMatch && readerMatch[1]) {
+              let deepLink = readerMatch[1];
+              if (deepLink.startsWith('/')) {
+                // Resolve relative path
+                try {
+                  const urlObj = new URL(targetUrl);
+                  deepLink = `${urlObj.origin}${deepLink}`;
+                } catch (e) { }
+              }
+
+              console.log("Found Deep PDF Link in HTML, recursing:", deepLink);
+              const deepDoc = await attemptDownload(deepLink, depth + 1);
+              if (deepDoc) return deepDoc;
+            }
+          }
+
           let finalHtml = htmlText;
-
-          // Scraper logic removed as per user request
-
-          // If it's a regular Publisher HTML page, we still save it, but maybe prioritize Sci-Hub later?
-          // For now, return the HTML doc.
+          // ... (rest of HTML logic)
 
           // INJECT BASE TAG TO FIX RELATIVE LINKS
           try {
             const urlObj = new URL(targetUrl);
             const baseTag = `<base href="${urlObj.origin}" target="_blank">`;
-            // Try to inject after head, otherwise prepend to body or just at start
             if (finalHtml.includes('<head>')) {
               finalHtml = finalHtml.replace('<head>', `<head>${baseTag}`);
             } else {
@@ -853,53 +1006,64 @@ const ResultsView: React.FC<ResultsViewProps> = ({
     try {
       let finalDoc: DownloadedDocument | null = null;
 
-      // ATTEMPT 1: Verified Source URL (The Green Button Link)
-      // We only skip this if it's a generic DOI link which we know needs Sci-Hub
-      const isGenericDoi = paper.url && paper.url.includes('doi.org');
+      // DERIVE READER LINK FROM URL (Fallback if API didn't provide ID)
+      // Matches pattern: /paper/Title-Slug/PAPER_ID
+      const idMatch = paper.url?.match(/paper\/.*\/([a-f0-9]{40})/);
+      let derivedReaderLink = paper.semanticReaderLink;
 
-      if (paper.url && !isGenericDoi) {
-        console.log("Attempt 1: Verified Source URL", paper.url);
-        finalDoc = await attemptDownload(paper.url);
+      if (!derivedReaderLink && idMatch && idMatch[1]) {
+        derivedReaderLink = `https://www.semanticscholar.org/reader/${idMatch[1]}`;
       }
 
-      // ATTEMPT 2: Sci-Hub Fallback
-      // If Attempt 1 failed OR returned HTML (when we might prefer a Real PDF), OR if Attempt 1 was skipped
-      // Note: If Attempt 1 gave us HTML, we might still want to try Sci-Hub to see if we can get a PDF.
-      // But for now, if Attempt 1 succeeded with HTML, we keep it, UNLESS the user explicitly wants PDF priority.
-      // Let's assume if Attempt 1 returned NULL, we try Sci-Hub.
+      // Priority: Semantic Reader (User Preference) -> OpenAccess PDF -> Source URL
+      const primaryUrl = derivedReaderLink || paper.openAccessPdf || paper.url;
 
-      if ((!finalDoc || finalDoc.type === 'html')) {
-        // Fallback removed as per user request (No Sci-Hub)
+      if (primaryUrl) {
+        console.log("Attempting download from:", primaryUrl);
+        finalDoc = await attemptDownload(primaryUrl);
+      }
+
+      // Secondary fallback
+      if (!finalDoc && paper.url && paper.url !== primaryUrl) {
+        console.log("Primary failed, trying fallback to Source URL:", paper.url);
+        finalDoc = await attemptDownload(paper.url);
       }
 
       if (finalDoc) {
         setDocuments(prev => [...prev, finalDoc!]);
         setSelectedDocId(finalDoc.id);
+        setActiveTab('data');
+        setActiveDataSubTab('docs');
+        addLog('LIBRARIAN', `Download complete. Switching to Data View...`, 'success');
       } else {
-        // Ultimate Fallback: Just Link
         throw new Error("All download attempts failed");
       }
     } catch (error) {
-      // Silent fallback
+      // Silent fallback to Google Docs Viewer
+      console.warn("Download failed, using viewer fallback...");
       const docId = Math.random().toString(36).substring(7);
-      const isPdf = paper.url?.toLowerCase().includes('.pdf');
+      const isPdf = (paper.openAccessPdf || paper.url || "").toLowerCase().includes('.pdf');
+      const targetUrl = paper.openAccessPdf || paper.url || "";
 
       // Use Google Docs Viewer for PDFs to bypass "Force Download" headers and X-Frame-Options
       const viewerUrl = isPdf
-        ? `https://docs.google.com/gview?url=${encodeURIComponent(paper.url || "")}&embedded=true`
-        : (paper.url || "");
+        ? `https://docs.google.com/gview?url=${encodeURIComponent(targetUrl)}&embedded=true`
+        : targetUrl;
 
       const newDoc: DownloadedDocument = {
         id: docId,
         paperId: index,
         title: paper.title,
-        type: 'pdf', // Force 'pdf' type so it uses <iframe src="..."> instead of srcDoc
+        type: 'pdf', // Force 'pdf' type so it uses <iframe src="...">
         content: viewerUrl,
-        originalUrl: paper.url || "",
+        originalUrl: targetUrl,
         timestamp: new Date().toLocaleTimeString()
       };
       setDocuments(prev => [...prev, newDoc]);
       setSelectedDocId(docId);
+      setActiveTab('data');
+      setActiveDataSubTab('docs');
+      addLog('LIBRARIAN', `Displaying via Google Viewer (Download Restricted).`, 'warning');
     } finally {
       setIsDownloading(false);
     }
@@ -914,16 +1078,43 @@ const ResultsView: React.FC<ResultsViewProps> = ({
   const handleFetchAbstract = async (paper: Paper, index: number) => {
     setFetchingAbstractId(index);
     try {
-      const fullAbstract = await fetchAbstractFromUrl(
+      // SMART STRATEGY: 
+      // 1. Try Original Source URL (User Request)
+      // 2. If blocked/failed, try Semantic Scholar Detail Page (Fallback)
+      console.log(`Attempting exact source scrape: ${paper.url}`);
+      let fullAbstract = await fetchAbstractFromUrl(
         paper.url,
         provider as any,
         provider === 'ollama' ? ollamaConfig : undefined,
         apiKey
       );
 
+      // FALLBACK: If original source failed (e.g. 403, or PDF link, or Paywall), try Semantic Scholar
+      if (!fullAbstract || fullAbstract === "NO_ABSTRACT_FOUND" || fullAbstract.length < 100) {
+        if (paper.semanticReaderLink) {
+          console.log("Source scrape failed/insufficient. Trying Semantic Scholar Fallback...");
+          const idMatch = paper.semanticReaderLink.match(/reader\/([a-f0-9]+)/);
+          if (idMatch && idMatch[1]) {
+            const fallbackUrl = `https://www.semanticscholar.org/paper/${idMatch[1]}`;
+            const fallbackAbstract = await fetchAbstractFromUrl(
+              fallbackUrl,
+              provider as any,
+              provider === 'ollama' ? ollamaConfig : undefined,
+              apiKey
+            );
+            if (fallbackAbstract && fallbackAbstract.length > 100 && fallbackAbstract !== "NO_ABSTRACT_FOUND") {
+              fullAbstract = fallbackAbstract;
+            }
+          }
+        }
+      }
+
       if (fullAbstract && fullAbstract.length > 50 && fullAbstract !== "NO_ABSTRACT_FOUND") {
+        setEnhancedSummaries(prev => ({ ...prev, [index]: fullAbstract }));
         if (librarianResult) {
-          librarianResult.papers[index].summary = fullAbstract; // Mutate local result for immediate view
+          // Optional: Keep mutating for persistence if parent doesn't update, 
+          // but local state 'enhancedSummaries' is the visual driver.
+          librarianResult.papers[index].summary = fullAbstract;
         }
       }
     } catch (e) {
@@ -1154,7 +1345,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({
                 </div>
 
                 <button
-                  onClick={onGenerateReport}
+                  onClick={openPromptModal}
                   disabled={isRegenerating || !librarianResult?.papers || librarianResult?.papers.length === 0}
                   className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white px-8 py-3 rounded-xl font-bold flex items-center gap-3 transition-all shadow-xl shadow-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105"
                 >
@@ -1412,7 +1603,7 @@ const ResultsView: React.FC<ResultsViewProps> = ({
                         </h5>
                         <p className="text-xs font-mono text-zinc-500 mb-2">{paper.authors} ({paper.year})</p>
                         <div className="relative group/abstract">
-                          <p className={`text-sm text-zinc-400 mb-2 transition-all duration-300 ${paper.summary.length > 300 || enhancedSummaries[idx]?.length > 300 ? 'line-clamp-2 hover:line-clamp-none cursor-pointer bg-zinc-900/50 p-2 rounded hover:bg-zinc-800' : ''}`} title="Hover to expand">
+                          <p className={`text-sm text-zinc-400 mb-2 transition-all duration-300 ${(paper.summary || "").length > 300 || (enhancedSummaries[idx] || "").length > 300 ? 'line-clamp-2 hover:line-clamp-none cursor-pointer bg-zinc-900/50 p-2 rounded hover:bg-zinc-800' : ''}`} title="Hover to expand">
                             {enhancedSummaries[idx] || paper.summary}
                             {fetchingAbstractId === idx && !enhancedSummaries[idx] && (
                               <span className="ml-2 inline-flex items-center text-xs text-emerald-500 animate-pulse">
@@ -1432,6 +1623,16 @@ const ResultsView: React.FC<ResultsViewProps> = ({
                             <ShieldCheck size={12} /> Source
                             <ExternalLink size={10} className="opacity-70" />
                           </a>
+
+                          <button
+                            onClick={() => handleFetchAbstract(paper, idx)}
+                            disabled={fetchingAbstractId === idx}
+                            className="text-[10px] bg-indigo-900/20 text-indigo-400 hover:text-white hover:bg-indigo-600 px-2 py-1 rounded border border-indigo-500/30 transition-colors cursor-pointer flex items-center gap-1.5"
+                            title="Refetch Abstract using AI Proxy"
+                          >
+                            <RefreshCw size={12} className={fetchingAbstractId === idx ? "animate-spin" : ""} />
+                            {fetchingAbstractId === idx ? "Fetching..." : "Fetch Abstract"}
+                          </button>
 
                           {paper.doi && (
                             <span className="text-[10px] font-mono text-zinc-500 select-all border border-zinc-800 bg-zinc-950 px-2 py-1 rounded">
@@ -1466,6 +1667,74 @@ const ResultsView: React.FC<ResultsViewProps> = ({
           </div>
         )}
       </div>
+
+      {/* PROMPT EDITOR MODAL */}
+      {showPromptModal && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-300">
+          <div className="bg-zinc-900 border border-indigo-500/30 rounded-xl shadow-2xl max-w-4xl w-full p-6 ring-1 ring-indigo-500/20 max-h-[90vh] flex flex-col">
+            <div className="flex justify-between items-center mb-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-indigo-500/20 rounded-lg text-indigo-400">
+                  <Edit3 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">Customize Final Report Prompt</h3>
+                  <p className="text-zinc-400 text-xs">Edit the instructions sent to the AI Writer. You have full control.</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowPromptModal(false)}
+                className="p-2 hover:bg-zinc-800 rounded-lg text-zinc-500 hover:text-white transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 min-h-[400px] mb-6 relative group">
+              <textarea
+                value={promptText}
+                onChange={(e) => setPromptText(e.target.value)}
+                className="w-full h-full bg-zinc-950/50 border border-zinc-700/50 rounded-lg p-4 font-mono text-sm text-zinc-300 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 outline-none resize-none leading-relaxed selection:bg-indigo-500/30"
+                placeholder="Enter prompt instructions here..."
+              />
+              <div className="absolute top-2 right-2 text-[10px] text-zinc-600 font-mono bg-zinc-900 border border-zinc-800 px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                Editable AI Instructions
+              </div>
+            </div>
+
+            <div className="flex justify-between items-center bg-zinc-950/50 p-3 rounded-lg border border-zinc-800/50">
+              <div className="text-xs text-zinc-500 max-w-md">
+                <span className="text-amber-500 font-bold">Important:</span> Any text you write here will be sent directly to the AI model.
+                Keep the "Abstract Verbatim" rules if you want to avoid translation.
+              </div>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowPromptModal(false)}
+                  className="px-4 py-2 text-sm font-bold text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    if (!librarianResult?.papers) return;
+                    // MERGE & SEND
+                    const mergedPapers = librarianResult.papers.map((p, i) => ({
+                      ...p,
+                      summary: enhancedSummaries[i] || p.summary
+                    }));
+                    onGenerateReport(mergedPapers, promptText);
+                    setShowPromptModal(false);
+                  }}
+                  className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-lg font-bold flex items-center gap-2 shadow-lg shadow-indigo-500/20 transition-all transform hover:scale-105"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  GENERATE REPORT NOW
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

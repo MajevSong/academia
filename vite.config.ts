@@ -27,7 +27,7 @@ export default defineConfig(({ mode }) => {
             }
 
             try {
-              console.log(`[GenericProxy] Fetching: ${targetUrl}`);
+              // console.log(`[GenericProxy] Fetching: ${targetUrl}`);
 
               try {
                 const response = await fetch(targetUrl, {
@@ -62,8 +62,28 @@ export default defineConfig(({ mode }) => {
                 const contentDisposition = response.headers.get('content-disposition');
                 if (contentDisposition) res.setHeader('Content-Disposition', contentDisposition);
 
+                // Get the text buffer
                 const arrayBuffer = await response.arrayBuffer();
-                res.end(Buffer.from(arrayBuffer));
+
+                if (response.ok) {
+                  let htmlText = Buffer.from(arrayBuffer).toString('utf-8');
+
+                  // Strip Google Ads, Analytics, and GTM to prevent "ERR_BLOCKED_BY_CLIENT" and noise
+                  htmlText = htmlText.replace(/<script\b[^>]*src="[^"]*(googleads|googletagmanager|google-analytics)[^"]*"[^>]*>[\s\S]*?<\/script>/gmi, "");
+                  htmlText = htmlText.replace(/<script\b[^>]*>[\s\S]*?(gtag|GoogleAnalyticsObject)[\s\S]*?<\/script>/gmi, "");
+
+                  // PROXY LOGGING FOR DEBUGGING
+                  console.log(`[Proxy] Status: ${response.status} | Size: ${htmlText.length} chars | URL: ${targetUrl.substring(0, 50)}...`);
+
+                  res.statusCode = 200;
+                  res.setHeader('Content-Type', response.headers.get('Content-Type') || 'text/html');
+                  res.end(htmlText);
+                } else {
+                  console.log(`[Proxy] FAILED Status: ${response.status} | URL: ${targetUrl.substring(0, 50)}...`);
+                  res.statusCode = response.status;
+                  res.end(`Proxy Error: ${response.statusText}`);
+                }
+
               } catch (proxyError: any) {
                 console.error(`[GenericProxy] Failed to fetch ${targetUrl}:`, proxyError.message);
                 if (!res.headersSent) {

@@ -39,7 +39,7 @@ const App: React.FC = () => {
 
   // AI Provider & Search Settings
   const [aiProvider, setAiProvider] = useState<AIProvider>('ollama');
-  const [searchProvider, setSearchProvider] = useState<SearchProvider>('google');
+  const [searchProvider, setSearchProvider] = useState<SearchProvider>('semantic');
 
   // Search Filters
   const [minYear, setMinYear] = useState('');
@@ -47,7 +47,7 @@ const App: React.FC = () => {
   const [scanDepth, setScanDepth] = useState<number>(50); // Default to 50 for deep scan
 
   const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434');
-  const [ollamaModel, setOllamaModel] = useState('llama3');
+  const [ollamaModel, setOllamaModel] = useState('llama3.1');
   const [showSettings, setShowSettings] = useState(false);
 
   // Refs
@@ -190,19 +190,23 @@ const App: React.FC = () => {
   };
 
   // DETAILED REPORT GENERATION (MANUAL TRIGGER)
-  const handleGenerateDetailedReport = async () => {
-    if (!librarianRes || !librarianRes.papers) return;
+  const handleGenerateDetailedReport = async (providedPapers?: any[], customPrompt?: string) => {
+    // Prefer providedPapers (which contain enhanced abstracts), fallback to stored state
+    const papersToUse = providedPapers || librarianRes?.papers;
+    if (!papersToUse || papersToUse.length === 0) return;
 
     setIsRegenerating(true);
-    addLog('WRITER', 'Generating Detailed Bibliographic Report from sources...', 'working');
+    addLog('WRITER', `Generating Detailed Bibliographic Report from ${papersToUse.length} sources...`, 'working');
 
     try {
       const result = await GeminiService.generateDetailedBibliographicReport(
         topic,
-        librarianRes.papers,
+        papersToUse,
         documents,
         aiProvider,
-        getOllamaConfig()
+        getOllamaConfig(),
+        apiKey,
+        customPrompt
       );
       setFinalLatex(result);
       addLog('WRITER', 'Detailed Report Generated.', 'success');
@@ -1010,6 +1014,7 @@ const App: React.FC = () => {
               apiKey={apiKey}
               provider={aiProvider}
               ollamaConfig={{ baseUrl: ollamaUrl, model: ollamaModel }}
+              addLog={addLog}
             />
           </div>
         </div>
