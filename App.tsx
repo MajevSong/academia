@@ -46,7 +46,7 @@ const App: React.FC = () => {
 
   // AI Provider & Search Settings
   const [aiProvider, setAiProvider] = useState<AIProvider>('ollama');
-  const [searchProvider, setSearchProvider] = useState<SearchProvider>('semantic');
+  const [searchProvider, setSearchProvider] = useState<SearchProvider>('semantic_scholar');
 
   // Search Filters
   const [minYear, setMinYear] = useState('');
@@ -629,7 +629,7 @@ const App: React.FC = () => {
 
             {/* Search Filters (Scholars) */}
             {(searchProvider === 'semantic_scholar' || searchProvider === 'google_scholar') && (
-              <div className="space-y-2 bg-zinc-950/50 p-2 rounded border border-zinc-800/50">
+              <div key={`filters-${searchProvider}`} className="space-y-2 bg-zinc-950/50 p-2 rounded border border-zinc-800/50">
                 <label className="text-xs text-cyan-400 font-mono uppercase flex items-center gap-1">
                   <Filter className="w-3 h-3" /> Academic Filters
                 </label>
