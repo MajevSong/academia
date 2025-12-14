@@ -17,88 +17,142 @@ export default defineConfig(({ mode }) => {
         // Generic Proxy for any PDF/Page
         '/api/proxy': {
           target: 'http://localhost:3000', // Self-referential dummy
-          bypass: async (req, res) => {
-            const url = new URL(req.url || '', `http://${req.headers.host}`);
-            const targetUrl = url.searchParams.get('url');
-            if (!targetUrl) {
-              res.statusCode = 400;
-              res.end("Missing 'url' query parameter");
-              return false;
-            }
+          bypass: (() => {
+            // GLOBAL REQUEST CACHE - Prevents repeated requests to same URL
+            const recentRequests = new Map<string, number>();
+            const REQUEST_COOLDOWN_MS = 10000; // 10 second cooldown per URL
+            const MAX_REQUESTS_PER_MINUTE = 30;
+            let requestsThisMinute = 0;
+            let lastMinuteReset = Date.now();
 
-            try {
-              // console.log(`[GenericProxy] Fetching: ${targetUrl}`);
-
-              try {
-                const response = await fetch(targetUrl, {
-                  headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache',
-                    'Upgrade-Insecure-Requests': '1',
-                  },
-                  redirect: 'follow',
-                  signal: AbortSignal.timeout(15000) // Increase timeout to 15s
-                });
-
-                if (!response.ok) {
-                  console.warn(`[API] Proxy received status: ${response.status}`);
-                  res.statusCode = response.status;
-                  const text = await response.text();
-                  res.end(text);
-                  return false;
-                }
-
-                // Forward content type
-                const contentType = response.headers.get('content-type');
-                if (contentType) res.setHeader('Content-Type', contentType);
-
-                // Allow CORS for the helper
-                res.setHeader('Access-Control-Allow-Origin', '*');
-
-                // Forward Content-Disposition if present (for actual filenames)
-                const contentDisposition = response.headers.get('content-disposition');
-                if (contentDisposition) res.setHeader('Content-Disposition', contentDisposition);
-
-                // Get the text buffer
-                const arrayBuffer = await response.arrayBuffer();
-
-                if (response.ok) {
-                  let htmlText = Buffer.from(arrayBuffer).toString('utf-8');
-
-                  // Strip Google Ads, Analytics, and GTM to prevent "ERR_BLOCKED_BY_CLIENT" and noise
-                  htmlText = htmlText.replace(/<script\b[^>]*src="[^"]*(googleads|googletagmanager|google-analytics)[^"]*"[^>]*>[\s\S]*?<\/script>/gmi, "");
-                  htmlText = htmlText.replace(/<script\b[^>]*>[\s\S]*?(gtag|GoogleAnalyticsObject)[\s\S]*?<\/script>/gmi, "");
-
-                  // PROXY LOGGING FOR DEBUGGING
-                  console.log(`[Proxy] Status: ${response.status} | Size: ${htmlText.length} chars | URL: ${targetUrl.substring(0, 50)}...`);
-
-                  res.statusCode = 200;
-                  res.setHeader('Content-Type', response.headers.get('Content-Type') || 'text/html');
-                  res.end(htmlText);
-                } else {
-                  console.log(`[Proxy] FAILED Status: ${response.status} | URL: ${targetUrl.substring(0, 50)}...`);
-                  res.statusCode = response.status;
-                  res.end(`Proxy Error: ${response.statusText}`);
-                }
-
-              } catch (proxyError: any) {
-                console.error(`[GenericProxy] Failed to fetch ${targetUrl}:`, proxyError.message);
-                if (!res.headersSent) {
-                  res.statusCode = 504; // Gateway Timeout
-                  res.end(`Proxy Error: ${proxyError.message}`);
-                }
+            return async (req: any, res: any) => {
+              const url = new URL(req.url || '', `http://${req.headers.host}`);
+              const targetUrl = url.searchParams.get('url');
+              if (!targetUrl) {
+                res.statusCode = 400;
+                res.end("Missing 'url' query parameter");
                 return false;
               }
-            } catch (e) {
-              console.error("[GenericProxy] Error", e);
-              res.statusCode = 500;
-              res.end(JSON.stringify({ error: "Proxy Failed", details: e.message }));
-              return false;
-            }
-          }
+
+              // RATE LIMIT CHECK
+              const now = Date.now();
+              if (now - lastMinuteReset > 60000) {
+                requestsThisMinute = 0;
+                lastMinuteReset = now;
+              }
+              requestsThisMinute++;
+              if (requestsThisMinute > MAX_REQUESTS_PER_MINUTE) {
+                console.error(`[Proxy] RATE LIMIT: ${requestsThisMinute} requests/min exceeded!`);
+                res.statusCode = 429;
+                res.end("Rate limit exceeded");
+                return false;
+              }
+
+              // DUPLICATE REQUEST CHECK
+              const urlKey = targetUrl.split('?')[0]; // Normalize
+              const lastRequest = recentRequests.get(urlKey);
+              if (lastRequest && (now - lastRequest) < REQUEST_COOLDOWN_MS) {
+                console.warn(`[Proxy] BLOCKED DUPLICATE: ${urlKey} (cooldown active)`);
+                res.statusCode = 429;
+                res.end("Duplicate request blocked");
+                return false;
+              }
+              recentRequests.set(urlKey, now);
+
+              // Clean old entries
+              if (recentRequests.size > 100) {
+                for (const [key, time] of recentRequests) {
+                  if (now - time > REQUEST_COOLDOWN_MS) recentRequests.delete(key);
+                }
+              }
+
+              try {
+                // console.log(`[GenericProxy] Fetching: ${targetUrl}`);
+
+                try {
+                  const response = await fetch(targetUrl, {
+                    headers: {
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                      'Accept-Language': 'en-US,en;q=0.9',
+                      'Cache-Control': 'no-cache',
+                      'Pragma': 'no-cache',
+                      'Upgrade-Insecure-Requests': '1',
+                    },
+                    redirect: 'follow',
+                    signal: AbortSignal.timeout(15000) // Increase timeout to 15s
+                  });
+
+                  if (!response.ok) {
+                    console.warn(`[API] Proxy received status: ${response.status}`);
+
+                    // BLOCK 202 LOOP: Return 429 immediately to kill infinite loops
+                    if (response.status === 202) {
+                      console.log(`[Proxy] BLOCKED 202! Returning 429 to stop loop.`);
+                      res.statusCode = 429;
+                      res.end("Blocked: Resource Processing (202)");
+                      return false;
+                    }
+
+                    res.statusCode = response.status;
+                    const text = await response.text();
+                    res.end(text);
+                    return false;
+                  }
+
+                  // Forward content type
+                  const contentType = response.headers.get('content-type') || '';
+                  res.setHeader('Content-Type', contentType);
+
+                  // Allow CORS for the helper
+                  res.setHeader('Access-Control-Allow-Origin', '*');
+
+                  // Forward Content-Disposition if present (for actual filenames)
+                  const contentDisposition = response.headers.get('content-disposition');
+                  if (contentDisposition) res.setHeader('Content-Disposition', contentDisposition);
+
+                  // Get the response buffer
+                  const arrayBuffer = await response.arrayBuffer();
+                  const buffer = Buffer.from(arrayBuffer);
+
+                  // Check if it's a PDF (binary) or HTML (text)
+                  const isPdf = contentType.includes('pdf') ||
+                    contentType.includes('octet-stream') ||
+                    buffer.slice(0, 5).toString().includes('%PDF');
+
+                  if (isPdf) {
+                    // BINARY: Send PDF as-is without text conversion
+                    console.log(`[Proxy-v2] PDF Binary | Size: ${buffer.length} bytes | URL: ${targetUrl.substring(0, 50)}...`);
+                    res.setHeader('Content-Length', buffer.length);
+                    res.statusCode = 200;
+                    res.end(buffer);
+                  } else {
+                    // TEXT: Convert to string and strip ads
+                    let htmlText = buffer.toString('utf-8');
+                    htmlText = htmlText.replace(/<script\b[^>]*src="[^"]*(googleads|googletagmanager|google-analytics)[^"]*"[^>]*>[\s\S]*?<\/script>/gmi, "");
+                    htmlText = htmlText.replace(/<script\b[^>]*>[\s\S]*?(gtag|GoogleAnalyticsObject)[\s\S]*?<\/script>/gmi, "");
+
+                    console.log(`[Proxy-v2] HTML Text | Size: ${htmlText.length} chars | URL: ${targetUrl.substring(0, 50)}...`);
+                    res.statusCode = 200;
+                    res.end(htmlText);
+                  }
+
+                } catch (proxyError: any) {
+                  console.error(`[GenericProxy] Failed to fetch ${targetUrl}:`, proxyError.message);
+                  if (!res.headersSent) {
+                    res.statusCode = 504; // Gateway Timeout
+                    res.end(`Proxy Error: ${proxyError.message}`);
+                  }
+                  return false;
+                }
+              } catch (e) {
+                console.error("[GenericProxy] Error", e);
+                res.statusCode = 500;
+                res.end(JSON.stringify({ error: "Proxy Failed", details: e.message }));
+                return false;
+              }
+            };
+          })(),
         },
         // GOOGLE SCHOLAR PROXY (Robust Local Scraper)
         '/api/scholar': {

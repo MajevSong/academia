@@ -1,6 +1,8 @@
 import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { LibrarianResult, DataScientistResult, AnalysisResult, AIProvider, SearchProvider, OllamaConfig, Paper, SearchFilters, DownloadedDocument } from "../types";
 
+let isSemanticScholarRateLimited = false;
+
 // Initialize Gemini Client
 const getAIClient = (apiKey?: string) => {
   const key = apiKey || process.env.API_KEY;
@@ -130,9 +132,13 @@ export const extractTextFromPdf = async (blobUrl: string): Promise<string> => {
       fullText += `\n--- Page ${i} ---\n${pageText}`;
     }
     return fullText;
-  } catch (error) {
+  } catch (error: any) {
     console.error("PDF Parsing Error:", error);
-    return ""; // Fallback to empty string on failure
+    // Propagate critical errors to allow fallback logic triggers
+    if (error?.message?.includes('Bad encoding') || error?.name === 'FormatError') {
+      throw new Error(`PDF_CORRUPT: ${error.message}`);
+    }
+    return ""; // For minor errors, just return empty text
   }
 };
 
@@ -230,6 +236,14 @@ const optimizeSearchQuery = async (topic: string, provider: AIProvider, ollamaCo
 // --- REAL ACADEMIC SEARCH (Semantic Scholar) ---
 
 const searchSemanticScholar = async (query: string, filters?: SearchFilters, maxLimit: number = 10): Promise<Paper[]> => {
+  console.log(`[SemanticScholar API] Starting search for: "${query}" (maxLimit: ${maxLimit})`);
+
+  // CIRCUIT BREAKER: Check global rate limit status
+  if (isSemanticScholarRateLimited) {
+    console.warn("[SemanticScholar API] Skipping search - Global Circuit Breaker Active");
+    return []; // Return empty to allow fallbacks (e.g. Scraper) to take over
+  }
+
   let allPapers: Paper[] = [];
   try {
     // Added openAccessPdf to fields to prioritize direct PDF links, added tldr for better summaries
@@ -289,7 +303,18 @@ const searchSemanticScholar = async (query: string, filters?: SearchFilters, max
       }
 
       if (response.status === 429) {
-        if (retryCount > 3) break;
+        if (retryCount > 1) { // FAST FAILURE: Only retry once per batch
+          console.error("Semantic Scholar Rate Limit Exhausted. Tripping Circuit Breaker.");
+          isSemanticScholarRateLimited = true;
+
+          // Auto-reset after 60s
+          setTimeout(() => { isSemanticScholarRateLimited = false; }, 60000);
+
+          if (allPapers.length > 0) return allPapers;
+          throw new Error("SEMANTIC_SCHOLAR_RATE_LIMIT");
+        }
+
+        console.warn(`Rate limit hit. Waiting ${2000 * (retryCount + 1)}ms...`);
         await delay(2000 * (retryCount + 1));
         retryCount++;
         continue;
@@ -310,10 +335,11 @@ const searchSemanticScholar = async (query: string, filters?: SearchFilters, max
 
       const mappedBatch = data.data
         .filter((p: any) => {
-          const hasDoi = p.externalIds?.DOI;
+          // QUALITY FILTER: Require title, authors, AND abstract
           const hasTitle = p.title && p.title.length > 5;
           const hasAuthors = p.authors && p.authors.length > 0;
-          return hasDoi && hasTitle && hasAuthors;
+          const hasAbstract = p.abstract && p.abstract.length > 50; // Must have real abstract
+          return hasTitle && hasAuthors && hasAbstract;
         })
         .map((p: any) => {
           const authorList = p.authors.map((a: any) => a.name).join(", ");
@@ -327,13 +353,12 @@ const searchSemanticScholar = async (query: string, filters?: SearchFilters, max
             title: p.title,
             authors: authorList,
             year: p.year ? p.year.toString() : "N/A",
-            doi: p.externalIds.DOI,
+            doi: p.externalIds?.DOI || null,
             url: landingPageUrl,
             openAccessPdf: openAccessUrl, // Explicitly store the direct PDF link for value-add downloads
             semanticReaderLink: semanticReaderLink,
-            // Fallback chain: Abstract -> TLDR -> Placeholder
-            // Fallback chain: Abstract -> TLDR -> Placeholder
-            summary: p.abstract || (p.tldr ? p.tldr.text : "No abstract available.")
+            // ABSTRACT: Use as-is from API, no modification
+            summary: p.abstract || "No abstract available."
           };
         });
 
@@ -352,6 +377,116 @@ const searchSemanticScholar = async (query: string, filters?: SearchFilters, max
   }
 };
 
+
+// --- FALLBACK SCRAPER (JSON Extraction from SSR HTML) ---
+// Semantic Scholar is fully JavaScript-rendered, so DOM selectors don't work.
+// Instead, we look for embedded JSON data in script tags.
+const searchSemanticScholarHtmlFallback = async (query: string): Promise<Paper[]> => {
+  console.log("[HTML Fallback Scraper] Activated for:", query);
+  const targetUrl = `https://www.semanticscholar.org/search?q=${encodeURIComponent(query)}&sort=relevance`;
+  const papers: Paper[] = [];
+
+  try {
+    // 1. Fetch HTML via Proxy
+    const proxyUrl = `/api/proxy?url=${encodeURIComponent(targetUrl)}`;
+    console.log("[HTML Fallback Scraper] Fetching via proxy:", proxyUrl);
+    const res = await fetch(proxyUrl);
+    if (!res.ok) throw new Error(`Scraper fetch failed: ${res.status}`);
+    const htmlText = await res.text();
+    console.log(`[HTML Fallback Scraper] Received HTML: ${htmlText.length} chars`);
+
+    // 2. Try to extract JSON data from script tags (SSR hydration data)
+    // Look for patterns like __NEXT_DATA__, __PRELOADED_STATE__, or inline JSON
+
+    // Strategy A: Look for __NEXT_DATA__ (Next.js apps)
+    const nextDataMatch = htmlText.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextDataMatch) {
+      try {
+        const nextData = JSON.parse(nextDataMatch[1]);
+        console.log("[HTML Fallback Scraper] Found __NEXT_DATA__:", Object.keys(nextData));
+        // Navigate to the papers array - structure depends on Semantic Scholar's implementation
+        const pageProps = nextData?.props?.pageProps;
+        if (pageProps?.papers || pageProps?.results) {
+          const papersData = pageProps.papers || pageProps.results;
+          papersData.forEach((p: any) => {
+            papers.push({
+              title: p.title || "Untitled",
+              authors: p.authors?.map((a: any) => a.name).join(", ") || "Unknown",
+              year: p.year?.toString() || "N/A",
+              doi: p.externalIds?.DOI || null,
+              url: p.url || `https://www.semanticscholar.org/paper/${p.paperId}`,
+              openAccessPdf: p.openAccessPdf?.url || null,
+              summary: p.abstract || p.tldr?.text || "No abstract available.",
+              semanticReaderLink: p.paperId ? `https://www.semanticscholar.org/reader/${p.paperId}` : null
+            });
+          });
+        }
+      } catch (e) {
+        console.warn("[HTML Fallback Scraper] Failed to parse __NEXT_DATA__:", e);
+      }
+    }
+
+    // Strategy B: Look for inline JSON with paper data (common pattern)
+    if (papers.length === 0) {
+      // Look for JSON blobs containing paper titles
+      const jsonPatterns = [
+        /"title":"([^"]+)".*?"authors":\s*\[(.*?)\].*?"year":(\d+)/g,
+        /"paperId":"([^"]+)".*?"title":"([^"]+)"/g
+      ];
+
+      // Try to find paper JSON objects
+      const paperObjectPattern = /\{"paperId":"[a-f0-9]+","title":"[^"]+"/g;
+      const matches = htmlText.match(paperObjectPattern);
+      if (matches && matches.length > 0) {
+        console.log(`[HTML Fallback Scraper] Found ${matches.length} potential paper JSON objects`);
+        // This is a last resort - try to extract minimal data
+        matches.slice(0, 20).forEach(match => {
+          try {
+            // Find the full object by looking for closing brace
+            const startIdx = htmlText.indexOf(match);
+            let braceCount = 0;
+            let endIdx = startIdx;
+            for (let i = startIdx; i < htmlText.length && i < startIdx + 5000; i++) {
+              if (htmlText[i] === '{') braceCount++;
+              if (htmlText[i] === '}') braceCount--;
+              if (braceCount === 0) { endIdx = i + 1; break; }
+            }
+            const jsonStr = htmlText.substring(startIdx, endIdx);
+            const obj = JSON.parse(jsonStr);
+            if (obj.title) {
+              papers.push({
+                title: obj.title,
+                authors: obj.authors?.map((a: any) => a.name || a).join(", ") || "Unknown",
+                year: obj.year?.toString() || "N/A",
+                doi: obj.externalIds?.DOI || null,
+                url: `https://www.semanticscholar.org/paper/${obj.paperId || ''}`,
+                openAccessPdf: obj.openAccessPdf?.url || null,
+                summary: obj.abstract || obj.tldr?.text || "No abstract available.",
+                semanticReaderLink: obj.paperId ? `https://www.semanticscholar.org/reader/${obj.paperId}` : null
+              });
+            }
+          } catch (e) { /* Skip malformed objects */ }
+        });
+      }
+    }
+
+    // Strategy C: Regex fallback for embedded meta tags (last resort)
+    if (papers.length === 0) {
+      console.warn("[HTML Fallback Scraper] JSON extraction failed. Semantic Scholar may have changed their page structure.");
+      // Check for captcha
+      if (htmlText.toLowerCase().includes("captcha") || htmlText.toLowerCase().includes("verify") || htmlText.includes("429")) {
+        throw new Error("SEMANTIC_SCHOLAR_CAPTCHA");
+      }
+    }
+
+    console.log(`[HTML Fallback Scraper] Extracted ${papers.length} papers.`);
+    return papers;
+
+  } catch (e) {
+    console.error("HTML Fallback failed:", e);
+    return [];
+  }
+};
 
 // --- Vision Assistant ---
 export const extractDataFromGraph = async (
@@ -462,43 +597,83 @@ export const runLibrarianAgent = async (
 
   // SEMANTIC SCHOLAR STRATEGY (Default for Academic / Ollama)
   // We prefer Semantic Scholar for all academic queries unless explicitly Google
+  // CRITICAL: When using Ollama, we MUST use Semantic Scholar because the legacy Google Search
+  // (line 643+) uses Gemini API which doesn't work with Ollama.
   const useSemantic = searchProvider === 'semantic_scholar' || searchProvider === 'semantic' || provider === 'ollama';
+
+  console.log(`[Librarian] Search Strategy Decision: provider=${provider}, searchProvider=${searchProvider}, useSemantic=${useSemantic}`);
 
   if (useSemantic) {
     const targetDepth = filters.scanDepth || 50;
     let aggregatedPapers: Paper[] = [];
     const seenTitles = new Set<string>();
 
+    // AGGRESSIVE SEARCH: Keep trying different queries until we hit target
+    const queryStrategies: string[] = [];
+
+    // Strategy 1: AI-optimized query
     const aiQuery = await optimizeSearchQuery(topic, provider, ollamaConfig, apiKey);
-    console.log(`Librarian Strategy 1 (AI): "${aiQuery}"`);
-    const papers1 = await searchSemanticScholar(aiQuery, filters, targetDepth);
-    papers1.forEach(p => { if (!seenTitles.has(p.title)) { seenTitles.add(p.title); aggregatedPapers.push(p); } });
+    queryStrategies.push(aiQuery);
 
-    if (aggregatedPapers.length < targetDepth) {
-      const basicQuery = extractKeywordsBasic(topic);
+    // Strategy 2: Basic keywords
+    const basicQuery = extractKeywordsBasic(topic);
+    if (basicQuery !== aiQuery) queryStrategies.push(basicQuery);
+
+    // Strategy 3: Broad query (top 3 longest words)
+    const words = topic.replace(/[^\w\s]/g, '').split(/\s+/).sort((a, b) => b.length - a.length);
+    const broadQuery = words.slice(0, 3).join(' ');
+    if (broadQuery !== aiQuery && broadQuery !== basicQuery) queryStrategies.push(broadQuery);
+
+    // Strategy 4: Single longest word (very broad)
+    if (words[0] && words[0].length > 4) {
+      const singleWord = words[0];
+      if (!queryStrategies.includes(singleWord)) queryStrategies.push(singleWord);
+    }
+
+    // Strategy 5: Topic as-is
+    if (!queryStrategies.includes(topic)) queryStrategies.push(topic);
+
+    console.log(`[Librarian] Search strategies: ${queryStrategies.length} queries to try for ${targetDepth} papers`);
+
+    // Execute each strategy until we reach target
+    for (let i = 0; i < queryStrategies.length && aggregatedPapers.length < targetDepth; i++) {
+      const query = queryStrategies[i];
       const needed = targetDepth - aggregatedPapers.length;
-      console.log(`Librarian Strategy 2 (Basic): "${basicQuery}" (Need ${needed} more)`);
+      console.log(`[Librarian] Strategy ${i + 1}/${queryStrategies.length}: "${query}" (Need ${needed} more, Have ${aggregatedPapers.length})`);
 
-      if (basicQuery !== aiQuery) {
-        const papers2 = await searchSemanticScholar(basicQuery, filters, needed);
-        papers2.forEach(p => { if (!seenTitles.has(p.title)) { seenTitles.add(p.title); aggregatedPapers.push(p); } });
+      const papers = await searchSemanticScholar(query, filters, needed + 20); // Request extra to account for filtering
+      let added = 0;
+      papers.forEach(p => {
+        if (!seenTitles.has(p.title.toLowerCase())) {
+          seenTitles.add(p.title.toLowerCase());
+          aggregatedPapers.push(p);
+          added++;
+        }
+      });
+      console.log(`[Librarian] Strategy ${i + 1} added ${added} unique papers (Total: ${aggregatedPapers.length})`);
+
+      // Small delay between strategies to avoid rate limits
+      if (aggregatedPapers.length < targetDepth && i < queryStrategies.length - 1) {
+        await delay(1000);
       }
     }
 
+    // If still not enough, try Google Scholar
     if (aggregatedPapers.length < targetDepth) {
-      const words = topic.replace(/[^\w\s]/g, '').split(/\s+/).sort((a, b) => b.length - a.length);
-      const broadQuery = words.slice(0, 3).join(' ');
+      console.warn(`[Librarian] Semantic Scholar gave ${aggregatedPapers.length}/${targetDepth}. Trying Google Scholar...`);
       const needed = targetDepth - aggregatedPapers.length;
-
-      const papers3 = await searchSemanticScholar(broadQuery, filters, needed);
-      papers3.forEach(p => { if (!seenTitles.has(p.title)) { seenTitles.add(p.title); aggregatedPapers.push(p); } });
-    }
-
-    if (aggregatedPapers.length === 0) {
-      return { papers: [], researchGap: `Unable to find papers for topic: "${topic}". Try simplifying the topic manually.` };
+      const googlePapers = await searchGoogleScholar(topic, needed);
+      googlePapers.forEach(p => {
+        if (!seenTitles.has(p.title.toLowerCase())) {
+          seenTitles.add(p.title.toLowerCase());
+          aggregatedPapers.push(p);
+        }
+      });
+      console.log(`[Librarian] After Google Scholar: ${aggregatedPapers.length} total`);
     }
 
     const finalPapers = aggregatedPapers.slice(0, targetDepth);
+    console.log(`[Librarian] Final result: ${finalPapers.length}/${targetDepth} papers`);
     const gapAnalysis = "Gap analysis will be generated after Final Report.";
     return { papers: finalPapers, researchGap: gapAnalysis };
   }
@@ -568,6 +743,13 @@ export const fetchAbstractFromUrl = async (targetUrl: string, provider: AIProvid
     const res = await fetch(proxyUrl);
 
     console.log(`[Debug] Status: ${res.status} | OK: ${res.ok}`);
+
+    // CRITICAL: Handle 202 "Processing" status immediately - this causes infinite loops
+    if (res.status === 202) {
+      console.warn(`[Abstract Fetch] Semantic Scholar returned 202 (Processing). Aborting to prevent loop.`);
+      return "NO_ABSTRACT_FOUND";
+    }
+
     if (!res.ok) {
       console.log(`[Debug] Fetch failed logic triggered.`);
     }
@@ -582,14 +764,14 @@ export const fetchAbstractFromUrl = async (targetUrl: string, provider: AIProvid
       console.warn("Failed to read text:", e);
     }
 
-    // CHECK FOR CLOUDFLARE / AKAMAI / BOT BLOCKS
+    // CHECK FOR CLOUDFLARE / AKAMAI / BOT BLOCKS including 202 (processing state)
     const isBlocked = htmlText.includes("Please contact our support team") ||
       htmlText.includes("Reference number:") ||
       htmlText.includes("Cloudflare Ray ID") ||
       htmlText.includes("challenge-container") || // New: Cloudflare turnstile/challenge
       htmlText.includes("JavaScript is disabled") || // New: JS challenge
       htmlText.includes("verify that you're not a robot") ||
-      res.status === 403 || res.status === 504 || res.status === 401 || res.status === 429;
+      res.status === 202 || res.status === 403 || res.status === 504 || res.status === 401 || res.status === 429;
 
     if (isBlocked) {
       console.warn(`[Abstract Fetch] Blocked by Publisher Security (Status: ${res.status}). Pattern detected.`);
@@ -760,11 +942,49 @@ export const generateLiteratureReviewReport = async (topic: string, lib: Librari
       const r = await ai.models.generateContent({ model: "gemini-2.5-flash", contents: fullPrompt });
       finalReport = r.text || "Report generation failed.";
     }
-  } catch (e) {
-    console.error(e);
-    finalReport = "# Literature Review Error\n\nUnable to generate report.";
-  }
+  } catch (e) { console.error(e); finalReport = "Error generating report."; }
   return finalReport;
+};
+
+// NEW: Standalone Research Gap Analysis (User Triggered)
+export const generateResearchGapAnalysis = async (
+  topic: string,
+  papers: Paper[],
+  customPrompt: string | null,
+  provider: AIProvider,
+  ollamaConfig?: OllamaConfig,
+  apiKey?: string
+): Promise<string> => {
+  const papersContext = papers.map((p, i) => `[ID:${i + 1}] Title: ${p.title}\nAuthors: ${p.authors} (${p.year})\nSummary: ${p.summary}`).join("\n\n");
+
+  const defaultPrompt = `
+  Analyze the provided academic papers on the topic "${topic}" and identify critical research gaps.
+  
+  Your Output must be in Markdown format with the following structure:
+  ## Research Gaps in Current Literature
+  [Analyze 3-5 major gaps where information is missing, inconsistent, or outdated]
+  
+  ## Proposed Future Research Directions
+  [Suggest specific research questions or methodologies to address these gaps]
+  
+  ## Methodology Limitations
+  [Identify common limitations in the reviewed studies]
+  `;
+
+  const finalPrompt = `Role: Academic Researcher.\n${customPrompt || defaultPrompt}\n\nExisting Literature:\n${papersContext}`;
+
+  try {
+    if (provider === 'ollama' && ollamaConfig) {
+      return await callOllama(ollamaConfig, finalPrompt);
+    } else {
+      const ai = getAIClient(apiKey);
+      const response = await ai.models.generateContent({ model: "gemini-2.5-flash", contents: finalPrompt });
+      return response.text || "Gap analysis failed.";
+    }
+  } catch (e) {
+    console.error("Gap analysis failed:", e);
+    return "Error generating gap analysis.";
+  }
 };
 
 // --- NEW FUNCTION: Deep Literature Analysis (Using Full Text) ---
@@ -974,7 +1194,8 @@ ${fullText!.slice(0, 12000)}` : "[NO FULL TEXT - USE ABSTRACT ABOVE]"}
 };
 
 // --- NEW: DEDICATED GAP ANALYSIS ---
-export const generateResearchGapAnalysis = async (
+// REMOVED LEGACY FUNCTION
+const _legacy_generateResearchGapAnalysis = async (
   topic: string,
   papers: Paper[],
   documents: DownloadedDocument[],
@@ -1051,4 +1272,47 @@ DİL: TÜRKÇE (Akademik üslup).
     console.error("Gap Analysis Failed:", error);
     return "Error generating gap analysis.";
   }
+};
+
+// --- NEW: SIMPLE REPORT (Use existing abstracts) ---
+export const generateSimpleReport = (
+  topic: string,
+  papers: Paper[],
+): string => {
+  const date = new Date().toLocaleDateString();
+
+  let report = `# Literature Review: ${topic}\n\n`;
+  report += `**Generated Date:** ${date}\n\n`;
+  report += `> [!NOTE]\n> This report is a compilation of the identified sources.\n\n`;
+
+  // 1. Body
+  papers.forEach((paper, index) => {
+    report += `## ${index + 1}. ${paper.title}\n\n`;
+    report += `**Authors:** ${paper.authors} (${paper.year})\n`;
+    report += `**DOI/URL:** ${paper.doi || paper.url}\n\n`;
+
+    // Clean up summary if it's "Abstract not available"
+    let content = paper.summary;
+    if (!content || content.includes("No abstract available")) {
+      content = "Abstract not available for this source.";
+    }
+
+    report += `${content}\n\n`;
+  });
+
+  // 2. References
+  report += `# References\n\n`;
+
+  // Sort by author name for APA style
+  const sortedPapers = [...papers].sort((a, b) => {
+    const authorA = a.authors ? a.authors.toLowerCase() : "";
+    const authorB = b.authors ? b.authors.toLowerCase() : "";
+    return authorA.localeCompare(authorB);
+  });
+
+  sortedPapers.forEach((p) => {
+    report += `* ${p.authors} (${p.year}). *${p.title}*. Retrieved from ${p.doi ? 'https://doi.org/' + p.doi : p.url}\n`;
+  });
+
+  return report;
 };

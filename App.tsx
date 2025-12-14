@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BookOpen, BarChart2, Feather, Search, Play, Cpu, AlertTriangle, Plus, FileText, X, Globe, Lock, MessageSquare, Upload, Image as ImageIcon, Loader, Trash2, FileType, Settings, Server, Cloud, GraduationCap, Calendar, Filter, Layers, Sparkles } from 'lucide-react';
 import {
-  AppState, AgentStatus, LogEntry, LibrarianResult, DataScientistResult, ResearchScope, AIProvider, SearchProvider, DownloadedDocument
+  AppState, AgentStatus, LogEntry, LibrarianResult, DataScientistResult, ResearchScope, AIProvider, SearchProvider, DownloadedDocument, Paper
 } from './types';
+import { storageService } from './services/storageService';
 import * as GeminiService from './services/geminiService';
 import AgentCard from './components/AgentCard';
 import LogConsole from './components/LogConsole';
@@ -12,8 +13,14 @@ import ApiKeyModal from './components/ApiKeyModal';
 const App: React.FC = () => {
   // State
   const [topic, setTopic] = useState('');
+  // --- PERSISTENCE: Load from DB on Mount ---
+
+
   const [userContext, setUserContext] = useState('');
   const [fileName, setFileName] = useState<string | null>(null);
+  const [promptText, setPromptText] = useState(
+    "You are a helpful research assistant. Find academic papers and summarize them."
+  );
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +54,7 @@ const App: React.FC = () => {
   const [scanDepth, setScanDepth] = useState<number>(50); // Default to 50 for deep scan
 
   const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434');
-  const [ollamaModel, setOllamaModel] = useState('llama3.1');
+  const [ollamaModel, setOllamaModel] = useState('qwen2.5:32b');
   const [showSettings, setShowSettings] = useState(false);
 
   // Refs
@@ -60,6 +67,29 @@ const App: React.FC = () => {
   const [dataRes, setDataRes] = useState<DataScientistResult | null>(null);
   const [latexDraft, setLatexDraft] = useState<string | null>(null);
   const [finalLatex, setFinalLatex] = useState<string | null>(null);
+
+  // --- PERSISTENCE: Load from DB on Mount ---
+  useEffect(() => {
+    const loadPersistedData = async () => {
+      try {
+        const savedPapers = await storageService.getPapers();
+        if (savedPapers && savedPapers.length > 0) {
+          console.log(`[Storage] Loaded ${savedPapers.length} papers from local DB.`);
+          setLibrarianRes({ papers: savedPapers, researchGap: '' });
+        }
+      } catch (e) {
+        console.error("Failed to load persistence:", e);
+      }
+    };
+    loadPersistedData();
+  }, []);
+
+  // --- PERSISTENCE: Save to DB when papers update ---
+  useEffect(() => {
+    if (librarianRes?.papers && librarianRes.papers.length > 0) {
+      storageService.savePapers(librarianRes.papers).catch(console.error);
+    }
+  }, [librarianRes?.papers]);
 
   // Lifted Documents State (For Deep Analysis)
   const [documents, setDocuments] = useState<DownloadedDocument[]>([]);
@@ -108,12 +138,12 @@ const App: React.FC = () => {
       if (typeof text === 'string') {
         setUserContext(text);
         setFileName(file.name);
-        addLog('SYSTEM', `File attached: ${file.name}`, 'success');
+        addLog('SYSTEM', `File attached: ${file.name} `, 'success');
         setResearchMode('local');
       }
     };
     reader.onerror = () => {
-      addLog('SYSTEM', `Failed to read file: ${file.name}`, 'error');
+      addLog('SYSTEM', `Failed to read file: ${file.name} `, 'error');
     };
     reader.readAsText(file);
   };
@@ -189,44 +219,59 @@ const App: React.FC = () => {
     }
   };
 
-  // DETAILED REPORT GENERATION (MANUAL TRIGGER)
+  // NEW: Standalone Gap Analysis Handler
+  const handleGenerateGapAnalysis = async (customPrompt?: string) => {
+    if (!librarianRes) return;
+    setIsRegenerating(true);
+    addLog('WRITER', 'Generating Research Gap Analysis...', 'working');
+
+    try {
+      const gapAnalysis = await GeminiService.generateResearchGapAnalysis(
+        topic,
+        librarianRes.papers,
+        customPrompt || null,
+        aiProvider,
+        getOllamaConfig(),
+        apiKey
+      );
+
+      setLibrarianRes(prev => prev ? { ...prev, researchGap: gapAnalysis } : null);
+      addLog('WRITER', 'Research Gap Analysis Completed.', 'success');
+    } catch (e) {
+      console.error(e);
+      addLog('WRITER', 'Failed to generate gap analysis.', 'error');
+    } finally {
+      setIsRegenerating(false);
+    }
+  };
+
+  // DETAILED REPORT GENERATION (MANUAL TRIGGER - FAST MODE)
   const handleGenerateDetailedReport = async (providedPapers?: any[], customPrompt?: string) => {
     // Prefer providedPapers (which contain enhanced abstracts), fallback to stored state
     const papersToUse = providedPapers || librarianRes?.papers;
     if (!papersToUse || papersToUse.length === 0) return;
 
     setIsRegenerating(true);
-    addLog('WRITER', `Generating Detailed Bibliographic Report from ${papersToUse.length} sources...`, 'working');
+    addLog('WRITER', `Compiling Final Report from ${papersToUse.length} sources...`, 'working');
 
     try {
-      const result = await GeminiService.generateDetailedBibliographicReport(
-        topic,
-        papersToUse,
-        documents,
-        aiProvider,
-        getOllamaConfig(),
-        apiKey,
-        customPrompt
-      );
+      // FAST MODE: No AI, just compile
+      const result = GeminiService.generateSimpleReport(topic, papersToUse);
+
+      // Simulate a small delay for better UX (so it doesn't feel "brokenly" fast)
+      await new Promise(resolve => setTimeout(resolve, 800));
+
       setFinalLatex(result);
-      addLog('WRITER', 'Detailed Report Generated.', 'success');
+      addLog('WRITER', 'Final Report Compiled Successfully.', 'success');
 
-      // 2. Generate Research Gap (Post-Report)
-      addLog('WRITER', 'Identifying Research Gaps from comprehensive analysis...', 'working');
-      const gapAnalysis = await GeminiService.generateResearchGapAnalysis(
-        topic,
-        librarianRes.papers,
-        documents,
-        aiProvider,
-        getOllamaConfig()
-      );
-
-      setLibrarianRes(prev => prev ? { ...prev, researchGap: gapAnalysis } : null);
-      addLog('WRITER', 'Research Gap Analysis updated.', 'success');
+      // 2. Generate Research Gap (Post-Report) - Keep this AI for value add, or skip if user wants pure speed?
+      // User said "Sadece düzenleme yapacaksın", so let's skip the slow AI gap analysis for now to ensure speed.
+      // If we really want gap, we can do it in background, but let's prioritize the user's "10 min waiting" complaint.
+      setLibrarianRes(prev => prev ? { ...prev, researchGap: "" } : null);
 
     } catch (e) {
       console.error(e);
-      addLog('WRITER', 'Failed to generate report or gap analysis.', 'error');
+      addLog('WRITER', 'Failed to generate report.', 'error');
     } finally {
       setIsRegenerating(false);
     }
@@ -248,8 +293,8 @@ const App: React.FC = () => {
             return;
           }
 
-          addLog('SYSTEM', `Architect Agent analyzing input (${aiProvider.toUpperCase()})...`, 'info');
-          const fullInput = `${topic}\n\n${userContext}`;
+          addLog('SYSTEM', `Architect Agent analyzing input(${aiProvider.toUpperCase()})...`, 'info');
+          const fullInput = `${topic} \n\n${userContext} `;
           const analysis = await GeminiService.analyzeRequirements(fullInput, aiProvider, getOllamaConfig(), apiKey);
 
           if (!isMounted) return;
@@ -273,7 +318,7 @@ const App: React.FC = () => {
             addLog('LIBRARIAN', `Deep Scan Protocol Activated: Target ${scanDepth} papers...`, 'working');
           }
 
-          const fullContext = `${topic}\n\n${userContext}`;
+          const fullContext = `${topic} \n\n${userContext} `;
           const result = await GeminiService.runLibrarianAgent(topic, fullContext, researchMode, aiProvider, searchProvider, getSearchFilters(), getOllamaConfig(), apiKey);
           if (!isMounted) return;
 
@@ -307,12 +352,12 @@ const App: React.FC = () => {
           addLog('SYSTEM', 'Initializing Data Science Protocol...', 'info');
           await new Promise(resolve => setTimeout(resolve, 1500));
 
-          const fullContext = `${topic}\n\n${userContext}`;
+          const fullContext = `${topic} \n\n${userContext} `;
           const result = await GeminiService.runDataScientistAgent(topic, librarianRes.researchGap, fullContext, aiProvider, getOllamaConfig(), apiKey);
           if (!isMounted) return;
 
           setDataRes(result);
-          addLog('DATA', `Visualized provided results (${result.chartData.length} points).`, 'success');
+          addLog('DATA', `Visualized provided results(${result.chartData.length} points).`, 'success');
           setAppState(AppState.GHOSTWRITER);
         }
 
@@ -321,7 +366,7 @@ const App: React.FC = () => {
           addLog('SYSTEM', 'Initializing Ghostwriter Protocol...', 'info');
           await new Promise(resolve => setTimeout(resolve, 1500));
 
-          const fullContext = `${topic}\n\n${userContext}`;
+          const fullContext = `${topic} \n\n${userContext} `;
           const result = await GeminiService.runGhostwriterAgent(topic, librarianRes, dataRes, fullContext, researchMode, aiProvider, getOllamaConfig(), apiKey);
           if (!isMounted) return;
 
@@ -347,7 +392,7 @@ const App: React.FC = () => {
         console.error(err);
         const errorMsg = err instanceof Error ? err.message : 'Unknown error occurred';
         setError(errorMsg);
-        addLog('SYSTEM', `Critical Failure: ${errorMsg}`, 'error');
+        addLog('SYSTEM', `Critical Failure: ${errorMsg} `, 'error');
         setAppState(AppState.IDLE);
       }
     };
@@ -355,7 +400,8 @@ const App: React.FC = () => {
     runOrchestra();
 
     return () => { isMounted = false; };
-  }, [appState, topic, userContext, librarianRes, dataRes, latexDraft, addLog, researchMode, researchScope, aiProvider, searchProvider, ollamaUrl, ollamaModel, minYear, maxYear, scanDepth, apiKey]);
+    return () => { isMounted = false; };
+  }, [appState, topic, userContext, researchMode, researchScope, aiProvider, searchProvider, ollamaUrl, ollamaModel, minYear, maxYear, scanDepth, apiKey]);
 
   const handleStart = () => {
     if (!topic.trim()) return;
@@ -391,9 +437,9 @@ const App: React.FC = () => {
     if (searchProvider === 'semantic_scholar') providerLabel = 'Semantic Scholar';
     if (searchProvider === 'google_scholar') providerLabel = 'Google Scholar';
 
-    addLog('SYSTEM', `Boot sequence initiated (${aiProvider.toUpperCase()}) for: "${topic}"`, 'info');
+    addLog('SYSTEM', `Boot sequence initiated(${aiProvider.toUpperCase()}) for: "${topic}"`, 'info');
     if (researchMode === 'web') {
-      addLog('SYSTEM', `Search Provider: ${providerLabel}`, 'info');
+      addLog('SYSTEM', `Search Provider: ${providerLabel} `, 'info');
     }
 
     // Suggestion for Ollama + Semantic Scholar
@@ -406,7 +452,7 @@ const App: React.FC = () => {
     }
 
     if (userContext.trim()) {
-      addLog('SYSTEM', `User context loaded (${userContext.length} chars).`, 'info');
+      addLog('SYSTEM', `User context loaded(${userContext.length} chars).`, 'info');
     }
 
     setAppState(AppState.ANALYZING);
@@ -440,7 +486,7 @@ const App: React.FC = () => {
   const submitClarification = async () => {
     if (!userClarification.trim() && clarificationFiles.length === 0 && clarificationImages.length === 0) return;
 
-    let appendedContext = `\n\n[USER CLARIFICATION ON RESULTS]:\n${userClarification}`;
+    let appendedContext = `\n\n[USER CLARIFICATION ON RESULTS]: \n${userClarification} `;
     setIsAnalyzingImage(true);
 
     try {
@@ -454,17 +500,17 @@ const App: React.FC = () => {
               reader.onerror = reject;
               reader.readAsText(file);
             });
-            appendedContext += `\n\n[ATTACHED DATA FILE: ${file.name}]:\n${text}`;
-            addLog('SYSTEM', `Read file: ${file.name}`, 'success');
+            appendedContext += `\n\n[ATTACHED DATA FILE: ${file.name}]: \n${text} `;
+            addLog('SYSTEM', `Read file: ${file.name} `, 'success');
           } catch (e) {
             console.error(e);
-            addLog('SYSTEM', `Failed to read file: ${file.name}`, 'error');
+            addLog('SYSTEM', `Failed to read file: ${file.name} `, 'error');
           }
         }
       }
 
       if (clarificationImages.length > 0) {
-        addLog('SYSTEM', `Analyzing ${clarificationImages.length} attached graphs/images...`, 'info');
+        addLog('SYSTEM', `Analyzing ${clarificationImages.length} attached graphs / images...`, 'info');
         for (const img of clarificationImages) {
           try {
             addLog('SYSTEM', `Vision AI scanning: ${img.name}...`, 'working');
@@ -480,11 +526,11 @@ const App: React.FC = () => {
             });
 
             const imageAnalysis = await GeminiService.extractDataFromGraph(base64Data, img.type, aiProvider, getOllamaConfig(), apiKey);
-            appendedContext += `\n\n[GRAPH ANALYSIS (${img.name})]:\n${imageAnalysis}`;
-            addLog('SYSTEM', `Analysis complete for: ${img.name}`, 'success');
+            appendedContext += `\n\n[GRAPH ANALYSIS(${img.name})]: \n${imageAnalysis} `;
+            addLog('SYSTEM', `Analysis complete for: ${img.name} `, 'success');
           } catch (e) {
             console.error(e);
-            addLog('SYSTEM', `Failed to analyze image: ${img.name}`, 'error');
+            addLog('SYSTEM', `Failed to analyze image: ${img.name} `, 'error');
           }
         }
       }
@@ -781,7 +827,7 @@ const App: React.FC = () => {
                 className="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-2 rounded-lg font-bold transition-colors flex items-center gap-2"
               >
                 {isAnalyzingImage ? <Loader className="w-4 h-4 animate-spin" /> : <MessageSquare className="w-4 h-4" />}
-                {isAnalyzingImage ? `Analyzing (${clarificationImages.length} images)...` : 'Submit & Continue'}
+                {isAnalyzingImage ? `Analyzing(${clarificationImages.length} images)...` : 'Submit & Continue'}
               </button>
             </div>
           </div>
@@ -861,7 +907,7 @@ const App: React.FC = () => {
                       }`}
                   >
                     <Globe className="w-3 h-3" />
-                    Web Search
+                    {researchScope === 'lit_review' ? 'Topic Exploration' : 'Web Search'}
                   </button>
                   <button
                     onClick={() => setResearchMode('local')}
@@ -871,7 +917,7 @@ const App: React.FC = () => {
                       }`}
                   >
                     <Lock className="w-3 h-3" />
-                    Local Context
+                    {researchScope === 'lit_review' ? 'File Analysis' : 'Local Context'}
                   </button>
                 </div>
               </div>
@@ -962,7 +1008,7 @@ const App: React.FC = () => {
         )}
 
         {/* Agents Grid */}
-        <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <section className={`grid grid-cols-1 md:grid-cols-2 ${researchScope === 'lit_review' ? 'lg:grid-cols-2 max-w-4xl mx-auto' : 'lg:grid-cols-4'} gap-4`}>
           <AgentCard
             name="Librarian"
             role={researchMode === 'local' ? 'Internal Scanner' : 'RAG Specialist'}
@@ -970,27 +1016,35 @@ const App: React.FC = () => {
             status={getAgentStatus(AppState.LIBRARIAN)}
             icon={<BookOpen className="w-5 h-5" />}
           />
-          <AgentCard
-            name="Data Scientist"
-            role="Python Sandbox"
-            description="Generates synthetic datasets and performs statistical analysis."
-            status={getAgentStatus(AppState.DATA_SCIENTIST)}
-            icon={<BarChart2 className="w-5 h-5" />}
-          />
+
+          {researchScope === 'full_paper' && (
+            <AgentCard
+              name="Data Scientist"
+              role="Python Sandbox"
+              description="Generates synthetic datasets and performs statistical analysis."
+              status={getAgentStatus(AppState.DATA_SCIENTIST)}
+              icon={<BarChart2 className="w-5 h-5" />}
+            />
+          )}
+
           <AgentCard
             name={researchScope === 'lit_review' ? 'Review Specialist' : 'Ghostwriter'}
             role={researchScope === 'lit_review' ? 'Synthesis Engine' : 'Expert Author'}
             description={researchScope === 'lit_review' ? 'Synthesizes sources into a thematic review report.' : 'Drafts long-form, human-like content using unique phrasing.'}
-            status={getAgentStatus(AppState.GHOSTWRITER)}
+            status={getAgentStatus(AppState.GHOSTWRITER)} // Ghostwriter state maps to Lit Writer in getAgentStatus
             icon={<Feather className="w-5 h-5" />}
           />
-          <AgentCard
-            name="Chief Editor"
-            role="Final Polish"
-            description="Expands the draft and ensures a natural, fluent academic tone."
-            status={getAgentStatus(AppState.REVIEWER)}
-            icon={<Search className="w-5 h-5" />}
-          />
+
+          {researchScope === 'full_paper' && (
+            <AgentCard
+              name="Chief Editor"
+              role="Final Polish"
+              description="Expands the draft and ensures a natural, fluent academic tone."
+              status={getAgentStatus(AppState.REVIEWER)}
+              icon={<Search className="w-5 h-5" />}
+            />
+          )}
+
         </section>
 
         {/* Main Workspace */}
@@ -1010,6 +1064,7 @@ const App: React.FC = () => {
               setDocuments={setDocuments}
               onRegenerate={handleRegenerateAnalysis}
               onGenerateReport={handleGenerateDetailedReport}
+              onGenerateGapAnalysis={handleGenerateGapAnalysis}
               isRegenerating={isRegenerating}
               apiKey={apiKey}
               provider={aiProvider}
