@@ -203,9 +203,25 @@ export const refineResearchTopic = async (topic: string, provider: AIProvider, o
 };
 
 // --- QUERY OPTIMIZER ---
+// Helper to sanitize AI output - remove non-Latin characters (fixes Ollama Chinese text bug)
+const sanitizeSearchQuery = (text: string): string => {
+  // Remove non-ASCII/Latin characters (Chinese, Arabic, etc.) that some models inject
+  let clean = text.replace(/[^\x00-\x7F\u00C0-\u024F]/g, ' ');
+  // Remove extra explanatory text patterns
+  clean = clean.replace(/keywords?:?/gi, '')
+    .replace(/search terms?:?/gi, '')
+    .replace(/output:?/gi, '')
+    .replace(/example:?/gi, '')
+    .replace(/\([^)]*\)/g, '') // Remove parenthetical notes
+    .replace(/["'`:;]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean;
+};
+
 const optimizeSearchQuery = async (topic: string, provider: AIProvider, ollamaConfig?: OllamaConfig, apiKey?: string): Promise<string> => {
   const prompt = `Task: Extract 3-5 distinct academic search keywords from: "${topic}".
-  Output ONLY the keywords separated by spaces. No explanations. No bullets.
+  Output ONLY the keywords separated by spaces. No explanations. No bullets. English only.
   Example: "Impact of AI on cancer" -> "artificial intelligence cancer oncology diagnosis"`;
 
   try {
@@ -221,9 +237,13 @@ const optimizeSearchQuery = async (topic: string, provider: AIProvider, ollamaCo
       keywords = (response.text || topic).trim();
     }
 
-    let clean = keywords.replace(/["\n]/g, ' ').replace(/keywords?:?/i, '').trim();
+    // CRITICAL: Sanitize output to remove non-Latin characters (Ollama Chinese text bug fix)
+    let clean = sanitizeSearchQuery(keywords);
+    console.log(`[Query Optimizer] Raw: "${keywords.substring(0, 100)}..." -> Clean: "${clean}"`);
 
-    if (clean.length < 5 || clean.includes(topic)) {
+    // Validate: must have at least some real words
+    if (clean.length < 5 || clean.split(' ').filter(w => w.length > 2).length < 2) {
+      console.warn("[Query Optimizer] AI output invalid, using basic extraction.");
       return extractKeywordsBasic(topic);
     }
     return clean;
@@ -303,19 +323,22 @@ const searchSemanticScholar = async (query: string, filters?: SearchFilters, max
       }
 
       if (response.status === 429) {
-        if (retryCount > 1) { // FAST FAILURE: Only retry once per batch
-          console.error("Semantic Scholar Rate Limit Exhausted. Tripping Circuit Breaker.");
-          isSemanticScholarRateLimited = true;
-
-          // Auto-reset after 60s
-          setTimeout(() => { isSemanticScholarRateLimited = false; }, 60000);
-
+        if (retryCount > 2) { // Allow 3 retries before giving up on this search
+          console.warn("Semantic Scholar Rate Limit: Max retries reached for this search.");
+          // IMPORTANT: Don't set global circuit breaker here - let other strategies try
+          // Only return what we have so far for THIS search
           if (allPapers.length > 0) return allPapers;
-          throw new Error("SEMANTIC_SCHOLAR_RATE_LIMIT");
+
+          // Set a SHORT circuit breaker (15s) to allow next strategy to work
+          isSemanticScholarRateLimited = true;
+          setTimeout(() => { isSemanticScholarRateLimited = false; }, 15000);
+          return [];
         }
 
-        console.warn(`Rate limit hit. Waiting ${2000 * (retryCount + 1)}ms...`);
-        await delay(2000 * (retryCount + 1));
+        // Exponential backoff: 3s, 6s, 9s
+        const waitTime = 3000 * (retryCount + 1);
+        console.warn(`Rate limit hit. Waiting ${waitTime}ms... (retry ${retryCount + 1}/3)`);
+        await delay(waitTime);
         retryCount++;
         continue;
       }
@@ -639,6 +662,11 @@ export const runLibrarianAgent = async (
     for (let i = 0; i < queryStrategies.length && aggregatedPapers.length < targetDepth; i++) {
       const query = queryStrategies[i];
       const needed = targetDepth - aggregatedPapers.length;
+
+      // IMPORTANT: Reset circuit breaker before each new strategy
+      // This allows fresh strategies to try even if previous one hit rate limits
+      isSemanticScholarRateLimited = false;
+
       console.log(`[Librarian] Strategy ${i + 1}/${queryStrategies.length}: "${query}" (Need ${needed} more, Have ${aggregatedPapers.length})`);
 
       const papers = await searchSemanticScholar(query, filters, needed + 20); // Request extra to account for filtering
@@ -652,9 +680,10 @@ export const runLibrarianAgent = async (
       });
       console.log(`[Librarian] Strategy ${i + 1} added ${added} unique papers (Total: ${aggregatedPapers.length})`);
 
-      // Small delay between strategies to avoid rate limits
+      // Longer delay between strategies to allow rate limits to cool down
       if (aggregatedPapers.length < targetDepth && i < queryStrategies.length - 1) {
-        await delay(1000);
+        console.log(`[Librarian] Waiting 5s before next strategy...`);
+        await delay(5000);
       }
     }
 
